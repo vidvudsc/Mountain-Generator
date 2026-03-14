@@ -20,12 +20,16 @@
 #define ATM_Z 64
 #define ATM_Y 16
 
-#define DEFAULT_TIME_SCALE 240.0f
+#define DEFAULT_TIME_SCALE 100.0f
 #define MAX_STEP_SECONDS 6.0f
 #define SLICE_TEX_SCALE 4
 
 #define HSLICE_ARROW_STEP 8
 #define VSLICE_ARROW_STEP 4
+#define WIND_ARROW_SCALE 0.42f
+#define WIND_ARROW_SHAFT_RADIUS 0.10f
+#define WIND_ARROW_HEAD_RADIUS 0.24f
+#define WIND_ARROW_HEAD_LENGTH 0.95f
 
 #define TERRAIN_GEN_SIZE 256
 #define TERRAIN_GEN_HEIGHT_WORLD 80.0f
@@ -157,14 +161,16 @@ typedef struct AtmosphereSim {
     Texture2D horizontalTex;
     Texture2D verticalTex;
     Texture2D volumeFieldTex;
+    Texture2D cloudTerrainTex;
     Color *horizontalPixels;
     Color *verticalPixels;
-    Color *volumeFieldPixels;
+    Vector4 *volumeFieldPixels;
     Model horizontalSliceModel;
     Model verticalSliceModelX;
     Model verticalSliceModelZ;
     Model cloudVolumeModel;
     Shader cloudVolumeShader;
+    Shader skyShader;
     int cloudVolumeLocMin;
     int cloudVolumeLocMax;
     int cloudVolumeLocCamera;
@@ -172,6 +178,13 @@ typedef struct AtmosphereSim {
     int cloudVolumeLocAtlas;
     int cloudVolumeLocParams;
     int cloudVolumeLocSun;
+    int skyLocSunDir;
+    int skyLocCamRight;
+    int skyLocCamUp;
+    int skyLocCamForward;
+    int skyLocAspect;
+    int skyLocTanHalfFov;
+    int skyLocSunStrength;
 
     FieldMode fieldMode;
     SliceAxis verticalAxis;
@@ -213,9 +226,11 @@ typedef struct AtmosphereSim {
 
     TerrainGenSettings terrainGen;
     int activeControlTab;
+    unsigned int frameCounter;
 } AtmosphereSim;
 
 static bool RebuildGeneratedTerrain(AtmosphereSim *sim);
+static void UpdateVolumeFieldTexture(AtmosphereSim *sim);
 
 typedef struct SimViewSettings {
     FieldMode fieldMode;
@@ -350,6 +365,49 @@ static const Color kCloudStops[] = {
     { 248, 250, 255, 255 }
 };
 
+static const Color kPressureStops[] = {
+    { 18, 33, 66, 255 },
+    { 52, 92, 153, 255 },
+    { 125, 167, 193, 255 },
+    { 219, 225, 213, 255 },
+    { 239, 199, 129, 255 },
+    { 168, 92, 40, 255 }
+};
+
+static const Color kDewPointStops[] = {
+    { 81, 44, 18, 255 },
+    { 135, 92, 42, 255 },
+    { 188, 154, 75, 255 },
+    { 116, 180, 110, 255 },
+    { 62, 146, 144, 255 },
+    { 193, 239, 226, 255 }
+};
+
+static const Color kVaporStops[] = {
+    { 18, 45, 56, 255 },
+    { 24, 96, 128, 255 },
+    { 49, 149, 175, 255 },
+    { 98, 202, 204, 255 },
+    { 196, 243, 230, 255 }
+};
+
+static const Color kRainStops[] = {
+    { 12, 22, 52, 255 },
+    { 24, 61, 140, 255 },
+    { 57, 118, 214, 255 },
+    { 110, 180, 240, 255 },
+    { 202, 238, 255, 255 }
+};
+
+static const Color kWindStops[] = {
+    { 17, 44, 73, 255 },
+    { 26, 122, 129, 255 },
+    { 85, 192, 124, 255 },
+    { 230, 215, 91, 255 },
+    { 233, 127, 44, 255 },
+    { 192, 49, 43, 255 }
+};
+
 static const Color kDivergingStops[] = {
     { 190, 82, 40, 255 },
     { 239, 206, 118, 255 },
@@ -432,6 +490,47 @@ static const char *kCloudVolumeFs =
     "uniform vec2 uAtlasGrid;\n"
     "uniform vec4 uCloudParams;\n"
     "uniform vec3 uSunDir;\n"
+    "uniform sampler2D texture1;\n"
+    "\n"
+    "float hash13(vec3 p) {\n"
+    "    p = fract(p * 0.1031);\n"
+    "    p += dot(p, p.zyx + 31.32);\n"
+    "    return fract((p.x + p.y) * p.z);\n"
+    "}\n"
+    "\n"
+    "float noise3dCustom(vec3 p) {\n"
+    "    vec3 i = floor(p);\n"
+    "    vec3 f = fract(p);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "\n"
+    "    float n000 = hash13(i + vec3(0.0, 0.0, 0.0));\n"
+    "    float n100 = hash13(i + vec3(1.0, 0.0, 0.0));\n"
+    "    float n010 = hash13(i + vec3(0.0, 1.0, 0.0));\n"
+    "    float n110 = hash13(i + vec3(1.0, 1.0, 0.0));\n"
+    "    float n001 = hash13(i + vec3(0.0, 0.0, 1.0));\n"
+    "    float n101 = hash13(i + vec3(1.0, 0.0, 1.0));\n"
+    "    float n011 = hash13(i + vec3(0.0, 1.0, 1.0));\n"
+    "    float n111 = hash13(i + vec3(1.0, 1.0, 1.0));\n"
+    "\n"
+    "    float nx00 = mix(n000, n100, f.x);\n"
+    "    float nx10 = mix(n010, n110, f.x);\n"
+    "    float nx01 = mix(n001, n101, f.x);\n"
+    "    float nx11 = mix(n011, n111, f.x);\n"
+    "    float nxy0 = mix(nx00, nx10, f.y);\n"
+    "    float nxy1 = mix(nx01, nx11, f.y);\n"
+    "    return mix(nxy0, nxy1, f.z);\n"
+    "}\n"
+    "\n"
+    "float fbm(vec3 p) {\n"
+    "    float value = 0.0;\n"
+    "    float amp = 0.55;\n"
+    "    for (int i = 0; i < 3; i++) {\n"
+    "        value += noise3dCustom(p) * amp;\n"
+    "        p = p * 2.03 + vec3(13.1, 7.7, 5.3);\n"
+    "        amp *= 0.5;\n"
+    "    }\n"
+    "    return value;\n"
+    "}\n"
     "\n"
     "vec4 sampleLayer(float layer, vec2 uvXZ) {\n"
     "    float cols = uAtlasGrid.x;\n"
@@ -450,9 +549,18 @@ static const char *kCloudVolumeFs =
     "    float y0 = floor(y);\n"
     "    float y1 = min(y0 + 1.0, uVolumeRes.z - 1.0);\n"
     "    float fy = fract(y);\n"
+    "    fy = fy * fy * (3.0 - 2.0 * fy);\n"
     "    vec4 a = sampleLayer(y0, uvw.xz);\n"
     "    vec4 b = sampleLayer(y1, uvw.xz);\n"
     "    return mix(a, b, fy);\n"
+    "}\n"
+    "\n"
+    "vec3 volumeUVW(vec3 worldPos) {\n"
+    "    return (worldPos - uVolumeMin) / (uVolumeMax - uVolumeMin);\n"
+    "}\n"
+    "\n"
+    "float terrainHeightAt(vec2 uvXZ) {\n"
+    "    return texture(texture1, clamp(uvXZ, vec2(0.001), vec2(0.999))).r * uVolumeMax.y;\n"
     "}\n"
     "\n"
     "bool intersectBox(vec3 ro, vec3 rd, out float tNear, out float tFar) {\n"
@@ -466,8 +574,25 @@ static const char *kCloudVolumeFs =
     "    return tFar > max(tNear, 0.0);\n"
     "}\n"
     "\n"
-    "float densityFromSample(vec4 s) {\n"
-    "    return max(s.r * 1.35 + s.g * 0.45 - uCloudParams.y, 0.0);\n"
+    "float densityFromSample(vec4 s, vec3 worldPos) {\n"
+    "    vec3 uvw = volumeUVW(worldPos);\n"
+    "    float condensate = s.r;\n"
+    "    float precip = s.g;\n"
+    "    float macroField = condensate * 1.45 + precip * 0.30;\n"
+    "    float macro = max(macroField - uCloudParams.y, 0.0);\n"
+    "    macro *= smoothstep(uCloudParams.y, uCloudParams.y + 0.06, macroField);\n"
+    "    if (macro <= 0.0001) return 0.0;\n"
+    "\n"
+    "    float terrainY = terrainHeightAt(uvw.xz);\n"
+    "    float groundFade = smoothstep(terrainY + 0.20, terrainY + 1.30, worldPos.y);\n"
+    "    if (groundFade <= 0.0001) return 0.0;\n"
+    "\n"
+    "    float verticalFade = smoothstep(0.02, 0.10, uvw.y) * (1.0 - smoothstep(0.88, 1.0, uvw.y));\n"
+    "    float detail = fbm(worldPos * vec3(0.030, 0.055, 0.030));\n"
+    "    float erosion = fbm(worldPos * vec3(0.075, 0.095, 0.075) + vec3(41.0, 17.0, 9.0));\n"
+    "    float shaped = macro * mix(0.72, 1.28, detail);\n"
+    "    shaped -= max(erosion - 0.58, 0.0) * 0.24;\n"
+    "    return max(shaped * verticalFade * groundFade, 0.0);\n"
     "}\n"
     "\n"
     "float sampleShadow(vec3 pos) {\n"
@@ -481,11 +606,11 @@ static const char *kCloudVolumeFs =
     "    float t = startT;\n"
     "    for (int i = 0; i < 10; i++) {\n"
     "        if (t >= endT || transmission <= 0.04) break;\n"
-    "        vec3 samplePos = pos + uSunDir * t;\n"
-    "        vec4 s = sampleVolume(samplePos);\n"
-    "        float density = densityFromSample(s);\n"
-    "        transmission *= exp(-density * uCloudParams.x * stepLen * 0.85);\n"
-    "        t += stepLen;\n"
+        "        vec3 samplePos = pos + uSunDir * t;\n"
+        "        vec4 s = sampleVolume(samplePos);\n"
+        "        float density = densityFromSample(s, samplePos);\n"
+        "        transmission *= exp(-density * uCloudParams.x * stepLen * 0.85);\n"
+        "        t += stepLen;\n"
     "    }\n"
     "    return clamp(transmission, 0.0, 1.0);\n"
     "}\n"
@@ -498,25 +623,29 @@ static const char *kCloudVolumeFs =
     "    float startT = max(tNear, 0.0) + 0.02;\n"
     "    float endT = max(tFar, startT);\n"
     "    float stepLen = max((endT - startT) / 56.0, 0.12);\n"
+    "    startT += stepLen * (hash13(fragWorldPos * 0.21 + uCameraPos * 0.07) - 0.5) * 0.38;\n"
     "    vec4 accum = vec4(0.0);\n"
     "    float t = startT;\n"
     "    for (int i = 0; i < 56; i++) {\n"
     "        if (t > endT || accum.a > 0.98) break;\n"
     "        vec3 pos = uCameraPos + rayDir * t;\n"
     "        vec4 s = sampleVolume(pos);\n"
-    "        float density = densityFromSample(s);\n"
+    "        float density = densityFromSample(s, pos);\n"
     "        if (density > 0.001) {\n"
     "            float light = clamp(s.b, 0.0, 1.0);\n"
     "            float temp = clamp(s.a, 0.0, 1.0);\n"
+    "            float precip = clamp(s.g, 0.0, 1.0);\n"
     "            float shadow = sampleShadow(pos);\n"
+    "            float thickShade = clamp(1.0 - density * 0.45, 0.20, 1.0);\n"
     "            vec3 coolCol = vec3(0.72, 0.80, 0.92);\n"
     "            vec3 warmCol = vec3(0.97, 0.88, 0.77);\n"
     "            vec3 wetCol = vec3(0.64, 0.70, 0.80);\n"
     "            vec3 baseCol = mix(coolCol, warmCol, clamp((temp - 0.30) * 1.25, 0.0, 1.0));\n"
-    "            baseCol = mix(baseCol, wetCol, clamp(s.g * 1.6, 0.0, 1.0));\n"
+    "            baseCol = mix(baseCol, wetCol, clamp(precip * 1.6, 0.0, 1.0));\n"
     "            float ambient = mix(0.08, 0.34, light);\n"
     "            float direct = mix(0.16, 1.0, light) * shadow;\n"
-    "            vec3 sampleCol = baseCol * (ambient + direct);\n"
+    "            vec3 sampleCol = baseCol * (ambient + direct * thickShade);\n"
+    "            sampleCol = min(sampleCol, vec3(0.98));\n"
     "            float alpha = (1.0 - exp(-density * uCloudParams.x * stepLen)) * uCloudParams.z;\n"
     "            accum.rgb += (1.0 - accum.a) * sampleCol * alpha;\n"
     "            accum.a += (1.0 - accum.a) * alpha;\n"
@@ -527,18 +656,74 @@ static const char *kCloudVolumeFs =
     "    finalColor = accum;\n"
     "}\n";
 
+static const char *kSkyVs =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec2 vertexTexCoord;\n"
+    "in vec4 vertexColor;\n"
+    "uniform mat4 mvp;\n"
+    "out vec2 fragTexCoord;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "    fragTexCoord = vertexTexCoord;\n"
+    "    fragColor = vertexColor;\n"
+    "    gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
+    "}\n";
+
+static const char *kSkyFs =
+    "#version 330\n"
+    "in vec2 fragTexCoord;\n"
+    "in vec4 fragColor;\n"
+    "out vec4 finalColor;\n"
+    "uniform vec3 uSunDir;\n"
+    "uniform vec3 uCamRight;\n"
+    "uniform vec3 uCamUp;\n"
+    "uniform vec3 uCamForward;\n"
+    "uniform float uAspect;\n"
+    "uniform float uTanHalfFov;\n"
+    "uniform float uSunStrength;\n"
+    "\n"
+    "void main() {\n"
+    "    vec2 ndc = fragTexCoord * 2.0 - 1.0;\n"
+    "    ndc.y = -ndc.y;\n"
+    "    vec3 viewDir = normalize(uCamForward + ndc.x * uAspect * uTanHalfFov * uCamRight + ndc.y * uTanHalfFov * uCamUp);\n"
+    "    float sunDot = max(dot(viewDir, normalize(uSunDir)), 0.0);\n"
+    "    float horizon = clamp(1.0 - max(viewDir.y, -0.25), 0.0, 1.0);\n"
+    "    float zenith = clamp(viewDir.y * 0.5 + 0.5, 0.0, 1.0);\n"
+    "    float sunHeight = clamp(uSunDir.y * 0.5 + 0.5, 0.0, 1.0);\n"
+    "\n"
+    "    vec3 deepBlue = vec3(0.03, 0.08, 0.18);\n"
+    "    vec3 skyBlue = vec3(0.24, 0.50, 0.92);\n"
+    "    vec3 horizonBlue = vec3(0.62, 0.76, 0.92);\n"
+    "    vec3 dusk = vec3(0.98, 0.56, 0.26);\n"
+    "    vec3 warmHaze = mix(dusk, vec3(1.0, 0.86, 0.66), sunHeight);\n"
+    "\n"
+    "    vec3 sky = mix(deepBlue, skyBlue, pow(zenith, 0.55));\n"
+    "    sky = mix(horizonBlue, sky, pow(zenith, 1.4));\n"
+    "    sky += warmHaze * pow(horizon, 3.0) * (0.18 + 0.42 * uSunStrength);\n"
+    "    sky += mix(vec3(1.0, 0.55, 0.22), vec3(1.0, 0.96, 0.86), sunHeight) * pow(sunDot, 28.0) * (0.28 + 0.55 * uSunStrength);\n"
+    "    sky += vec3(1.0, 0.82, 0.58) * pow(sunDot, 180.0) * (0.45 + 1.1 * uSunStrength);\n"
+    "    sky = mix(sky * 0.35, sky, clamp(zenith + 0.1, 0.0, 1.0));\n"
+    "    finalColor = vec4(sky, 1.0) * fragColor;\n"
+    "}\n";
+
 static bool SetupCloudVolumeResources(AtmosphereSim *sim) {
     sim->volumeAtlasCols = 4;
     sim->volumeAtlasRows = (sim->ny + sim->volumeAtlasCols - 1) / sim->volumeAtlasCols;
     int atlasWidth = sim->nx * sim->volumeAtlasCols;
     int atlasHeight = sim->nz * sim->volumeAtlasRows;
 
-    sim->volumeFieldPixels = (Color *)calloc((size_t)atlasWidth * (size_t)atlasHeight, sizeof(Color));
+    sim->volumeFieldPixels = (Vector4 *)calloc((size_t)atlasWidth * (size_t)atlasHeight, sizeof(Vector4));
     if (sim->volumeFieldPixels == NULL) return false;
 
-    Image image = GenImageColor(atlasWidth, atlasHeight, BLANK);
+    Image image = {
+        .data = sim->volumeFieldPixels,
+        .width = atlasWidth,
+        .height = atlasHeight,
+        .mipmaps = 1,
+        .format = PIXELFORMAT_UNCOMPRESSED_R32G32B32A32
+    };
     sim->volumeFieldTex = LoadTextureFromImage(image);
-    UnloadImage(image);
     if (sim->volumeFieldTex.id == 0) return false;
 
     SetTextureFilter(sim->volumeFieldTex, TEXTURE_FILTER_BILINEAR);
@@ -557,9 +742,61 @@ static bool SetupCloudVolumeResources(AtmosphereSim *sim) {
     sim->cloudVolumeLocAtlas = GetShaderLocation(sim->cloudVolumeShader, "uAtlasGrid");
     sim->cloudVolumeLocParams = GetShaderLocation(sim->cloudVolumeShader, "uCloudParams");
     sim->cloudVolumeLocSun = GetShaderLocation(sim->cloudVolumeShader, "uSunDir");
-
     sim->cloudVolumeModel.materials[0].shader = sim->cloudVolumeShader;
     sim->cloudVolumeModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = sim->volumeFieldTex;
+    return true;
+}
+
+static bool SetupSkyShaderResources(AtmosphereSim *sim) {
+    sim->skyShader = LoadShaderFromMemory(kSkyVs, kSkyFs);
+    if (sim->skyShader.id == 0) return false;
+
+    sim->skyLocSunDir = GetShaderLocation(sim->skyShader, "uSunDir");
+    sim->skyLocCamRight = GetShaderLocation(sim->skyShader, "uCamRight");
+    sim->skyLocCamUp = GetShaderLocation(sim->skyShader, "uCamUp");
+    sim->skyLocCamForward = GetShaderLocation(sim->skyShader, "uCamForward");
+    sim->skyLocAspect = GetShaderLocation(sim->skyShader, "uAspect");
+    sim->skyLocTanHalfFov = GetShaderLocation(sim->skyShader, "uTanHalfFov");
+    sim->skyLocSunStrength = GetShaderLocation(sim->skyShader, "uSunStrength");
+    return true;
+}
+
+static bool UpdateCloudTerrainTexture(AtmosphereSim *sim) {
+    if (sim->terrain.width <= 0 || sim->terrain.height <= 0 || sim->terrain.terrainY == NULL) return false;
+
+    int pixelCount = sim->terrain.width * sim->terrain.height;
+    Color *pixels = (Color *)MemAlloc((size_t)pixelCount * sizeof(Color));
+    if (pixels == NULL) return false;
+
+    for (int z = 0; z < sim->terrain.height; z++) {
+        for (int x = 0; x < sim->terrain.width; x++) {
+            int i = z * sim->terrain.width + x;
+            float terrainWorldY = sim->terrain.terrainY[i];
+            float normalized = Clamp(terrainWorldY / fmaxf(sim->topWorldY, 0.001f), 0.0f, 1.0f);
+            unsigned char packed = (unsigned char)(normalized * 255.0f);
+            pixels[i] = (Color) { packed, packed, packed, 255 };
+        }
+    }
+
+    Image image = {
+        .data = pixels,
+        .width = sim->terrain.width,
+        .height = sim->terrain.height,
+        .mipmaps = 1,
+        .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8
+    };
+
+    if (sim->cloudTerrainTex.id != 0) UnloadTexture(sim->cloudTerrainTex);
+    sim->cloudTerrainTex = LoadTextureFromImage(image);
+    UnloadImage(image);
+
+    if (sim->cloudTerrainTex.id == 0) return false;
+
+    SetTextureFilter(sim->cloudTerrainTex, TEXTURE_FILTER_BILINEAR);
+    SetTextureWrap(sim->cloudTerrainTex, TEXTURE_WRAP_CLAMP);
+    if (sim->cloudVolumeModel.materialCount > 0) {
+        sim->cloudVolumeModel.materials[0].maps[MATERIAL_MAP_SPECULAR].texture = sim->cloudTerrainTex;
+    }
     return true;
 }
 
@@ -1279,6 +1516,43 @@ static float DewPointC(float pressureHpa, float mixingRatio) {
     return (243.5f * lnRatio) / (17.67f - lnRatio);
 }
 
+static float BackgroundRelativeHumidity(float simSeconds, float altNorm) {
+    float dayProgress = fmodf(simSeconds, DAY_SECONDS) / DAY_SECONDS;
+    float diurnal = -0.05f * sinf(TAU * (dayProgress - 0.18f));
+    float boundaryLayer = 0.80f - 0.30f * altNorm;
+    float midLevelMoisture = 0.10f * expf(-powf((altNorm - 0.45f) / 0.22f, 2.0f));
+    return Clamp(boundaryLayer + midLevelMoisture + diurnal, 0.20f, 0.97f);
+}
+
+static float BackgroundMixingRatio(float simSeconds, float altNorm, float tempC, float pressureHpa) {
+    return SaturationMixingRatio(tempC, pressureHpa) * BackgroundRelativeHumidity(simSeconds, altNorm);
+}
+
+static float VirtualTemperatureK(float tempC, float vaporMixingRatio, float cloudMixingRatio, float rainMixingRatio) {
+    float tempK = tempC + 273.15f;
+    float condensed = fmaxf(cloudMixingRatio + rainMixingRatio, 0.0f);
+    return tempK * (1.0f + 0.61f * vaporMixingRatio - condensed);
+}
+
+static float VerticalSecondDerivative(const AtmosphereSim *sim, const float *field, int x, int y, int z) {
+    int i = AtmosIndex(sim, x, y, z);
+    float center = field[i];
+
+    float below = center;
+    float above = center;
+    if (y > 0 && IsFluidCell(sim, x, y - 1, z)) below = field[AtmosIndex(sim, x, y - 1, z)];
+    if (y + 1 < sim->ny && IsFluidCell(sim, x, y + 1, z)) above = field[AtmosIndex(sim, x, y + 1, z)];
+
+    float dy2 = sim->dyMeters * sim->dyMeters;
+    return (above - 2.0f * center + below) / fmaxf(dy2, 1.0f);
+}
+
+static float PressureAnomalySample(const AtmosphereSim *sim, const float *pressureField, int x, int y, int z) {
+    if (x < 0 || x >= sim->nx || y < 0 || y >= sim->ny || z < 0 || z >= sim->nz) return 0.0f;
+    if (!IsFluidCell(sim, x, y, z)) return 0.0f;
+    return pressureField[AtmosIndex(sim, x, y, z)] - BasePressureAtAltitude(CellAltitudeMeters(sim, y));
+}
+
 static ImVec2_c ImVec2Make(float x, float y) {
     ImVec2_c value = { x, y };
     return value;
@@ -1394,7 +1668,9 @@ static void DestroySim(AtmosphereSim *sim) {
     if (sim->horizontalTex.id != 0) UnloadTexture(sim->horizontalTex);
     if (sim->verticalTex.id != 0) UnloadTexture(sim->verticalTex);
     if (sim->volumeFieldTex.id != 0) UnloadTexture(sim->volumeFieldTex);
+    if (sim->cloudTerrainTex.id != 0) UnloadTexture(sim->cloudTerrainTex);
     if (sim->cloudVolumeShader.id != 0) UnloadShader(sim->cloudVolumeShader);
+    if (sim->skyShader.id != 0) UnloadShader(sim->skyShader);
 
     free(sim->columnTerrainMeters);
     free(sim->columnTerrainWorldY);
@@ -1514,6 +1790,14 @@ static bool AllocateSim(AtmosphereSim *sim) {
     sim->horizontalSliceModel.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = sim->horizontalTex;
     sim->verticalSliceModelX.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = sim->verticalTex;
     sim->verticalSliceModelZ.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = sim->verticalTex;
+
+    if (!SetupCloudVolumeResources(sim)) {
+        return false;
+    }
+    if (!SetupSkyShaderResources(sim)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1609,12 +1893,13 @@ static void ResetAtmosphere(AtmosphereSim *sim) {
     sim->showVolume = false;
     sim->paused = false;
     sim->showUI = true;
-    sim->cloudRenderAlpha = 0.72f;
-    sim->cloudRenderThreshold = 0.06f;
-    sim->cloudDensityScale = 0.95f;
+    sim->cloudRenderAlpha = 0.64f;
+    sim->cloudRenderThreshold = 0.08f;
+    sim->cloudDensityScale = 1.10f;
     sim->volumeThreshold = 0.42f;
     sim->volumeAlpha = 0.42f;
     sim->volumeStride = 5;
+    sim->frameCounter = 0;
     sim->sunDir = Vector3Normalize((Vector3) { 0.2f, 1.0f, 0.3f });
     sim->solarStrength = 0.0f;
 
@@ -1650,9 +1935,9 @@ static void ResetAtmosphere(AtmosphereSim *sim) {
                 float altNorm = altitude / sim->topMeters;
                 float baseTemp = seaLevelTemp - 0.0065f * altitude;
                 float basePressure = BasePressureAtAltitude(altitude);
-                float qsat = SaturationMixingRatio(baseTemp, basePressure);
-                float humidityFactor = 0.58f + 0.30f * (1.0f - altNorm) + (NoiseCoord((float)x, (float)y, (float)z) - 0.5f) * 0.14f;
-                float qv = Clamp(qsat * humidityFactor, 0.0002f, qsat * 0.995f);
+                float humidityFactor = 1.0f + (NoiseCoord((float)x, (float)y, (float)z) - 0.5f) * 0.18f;
+                float qv = Clamp(BackgroundMixingRatio(sim->simSeconds, altNorm, baseTemp, basePressure) * humidityFactor,
+                                 0.0002f, SaturationMixingRatio(baseTemp, basePressure) * 0.995f);
 
                 sim->temp[i] = baseTemp + (NoiseCoord((float)x, (float)y * 1.7f, (float)z * 0.8f) - 0.5f) * 1.1f;
                 sim->pressure[i] = basePressure + (NoiseCoord((float)x, (float)y, (float)z * 1.9f) - 0.5f) * 0.8f;
@@ -1667,6 +1952,8 @@ static void ResetAtmosphere(AtmosphereSim *sim) {
             }
         }
     }
+
+    if (sim->volumeFieldTex.id != 0) UpdateVolumeFieldTexture(sim);
 }
 
 static void UpdateStats(AtmosphereSim *sim) {
@@ -1902,7 +2189,11 @@ static void ApplyRadiationPass(AtmosphereSim *sim, float dt, float solar, Vector
     }
 }
 
-static void ProjectVelocityField(AtmosphereSim *sim) {
+static void ProjectVelocityField(AtmosphereSim *sim, float dt) {
+    float invDx2 = 1.0f / fmaxf(sim->dxMeters * sim->dxMeters, 1.0f);
+    float invDy2 = 1.0f / fmaxf(sim->dyMeters * sim->dyMeters, 1.0f);
+    float invDz2 = 1.0f / fmaxf(sim->dzMeters * sim->dzMeters, 1.0f);
+
     for (int z = 0; z < sim->nz; z++) {
         for (int y = 0; y < sim->ny; y++) {
             for (int x = 0; x < sim->nx; x++) {
@@ -1926,7 +2217,7 @@ static void ProjectVelocityField(AtmosphereSim *sim) {
 
     float *solveA = sim->pressureSolve;
     float *solveB = sim->pressureScratch;
-    for (int iter = 0; iter < 10; iter++) {
+    for (int iter = 0; iter < 8; iter++) {
         for (int z = 0; z < sim->nz; z++) {
             for (int y = 0; y < sim->ny; y++) {
                 for (int x = 0; x < sim->nx; x++) {
@@ -1937,18 +2228,37 @@ static void ProjectVelocityField(AtmosphereSim *sim) {
                     }
 
                     float sum = 0.0f;
-                    int count = 0;
-                    if (x > 0 && IsFluidCell(sim, x - 1, y, z)) { sum += solveA[AtmosIndex(sim, x - 1, y, z)]; count++; }
-                    if (x + 1 < sim->nx && IsFluidCell(sim, x + 1, y, z)) { sum += solveA[AtmosIndex(sim, x + 1, y, z)]; count++; }
-                    if (y > 0 && IsFluidCell(sim, x, y - 1, z)) { sum += solveA[AtmosIndex(sim, x, y - 1, z)]; count++; }
-                    if (y + 1 < sim->ny && IsFluidCell(sim, x, y + 1, z)) { sum += solveA[AtmosIndex(sim, x, y + 1, z)]; count++; }
-                    if (z > 0 && IsFluidCell(sim, x, y, z - 1)) { sum += solveA[AtmosIndex(sim, x, y, z - 1)]; count++; }
-                    if (z + 1 < sim->nz && IsFluidCell(sim, x, y, z + 1)) { sum += solveA[AtmosIndex(sim, x, y, z + 1)]; count++; }
+                    float denom = 0.0f;
+                    if (x > 0 && IsFluidCell(sim, x - 1, y, z)) {
+                        sum += solveA[AtmosIndex(sim, x - 1, y, z)] * invDx2;
+                        denom += invDx2;
+                    }
+                    if (x + 1 < sim->nx && IsFluidCell(sim, x + 1, y, z)) {
+                        sum += solveA[AtmosIndex(sim, x + 1, y, z)] * invDx2;
+                        denom += invDx2;
+                    }
+                    if (y > 0 && IsFluidCell(sim, x, y - 1, z)) {
+                        sum += solveA[AtmosIndex(sim, x, y - 1, z)] * invDy2;
+                        denom += invDy2;
+                    }
+                    if (y + 1 < sim->ny && IsFluidCell(sim, x, y + 1, z)) {
+                        sum += solveA[AtmosIndex(sim, x, y + 1, z)] * invDy2;
+                        denom += invDy2;
+                    }
+                    if (z > 0 && IsFluidCell(sim, x, y, z - 1)) {
+                        sum += solveA[AtmosIndex(sim, x, y, z - 1)] * invDz2;
+                        denom += invDz2;
+                    }
+                    if (z + 1 < sim->nz && IsFluidCell(sim, x, y, z + 1)) {
+                        sum += solveA[AtmosIndex(sim, x, y, z + 1)] * invDz2;
+                        denom += invDz2;
+                    }
 
-                    if (count == 0) {
+                    if (denom <= 0.0f) {
                         solveB[i] = 0.0f;
                     } else {
-                        solveB[i] = (sum - sim->divergence[i] * sim->dxMeters * 0.42f) / (float)count;
+                        float rhs = sim->divergence[i] / fmaxf(dt, 0.2f);
+                        solveB[i] = (sum - rhs) / denom;
                     }
                 }
             }
@@ -1961,6 +2271,8 @@ static void ProjectVelocityField(AtmosphereSim *sim) {
 
     if (solveA != sim->pressureSolve) memcpy(sim->pressureSolve, solveA, (size_t)sim->cells3D * sizeof(float));
 
+    const float projectionStrength = 0.38f;
+    const float verticalStrength = 0.32f;
     for (int z = 0; z < sim->nz; z++) {
         for (int y = 0; y < sim->ny; y++) {
             for (int x = 0; x < sim->nx; x++) {
@@ -1971,10 +2283,14 @@ static void ProjectVelocityField(AtmosphereSim *sim) {
                 float gradPz = (FluidFieldSample(sim, sim->pressureSolve, x, y, z + 1) - FluidFieldSample(sim, sim->pressureSolve, x, y, z - 1)) / (2.0f * sim->dzMeters);
                 float gradPy = (FluidFieldSample(sim, sim->pressureSolve, x, y + 1, z) - FluidFieldSample(sim, sim->pressureSolve, x, y - 1, z)) / (2.0f * sim->dyMeters);
 
-                sim->uNext[i] -= gradPx * 22.0f;
-                sim->vNext[i] -= gradPz * 22.0f;
-                sim->wNext[i] -= gradPy * 12.0f;
-                sim->pressureNext[i] += sim->pressureSolve[i] * 34.0f;
+                sim->uNext[i] -= projectionStrength * dt * gradPx;
+                sim->vNext[i] -= projectionStrength * dt * gradPz;
+                sim->wNext[i] -= verticalStrength * dt * gradPy;
+
+                float du = (FluidFieldSample(sim, sim->uNext, x + 1, y, z) - FluidFieldSample(sim, sim->uNext, x - 1, y, z)) / (2.0f * sim->dxMeters);
+                float dv = (FluidFieldSample(sim, sim->vNext, x, y, z + 1) - FluidFieldSample(sim, sim->vNext, x, y, z - 1)) / (2.0f * sim->dzMeters);
+                float dw = (FluidFieldSample(sim, sim->wNext, x, y + 1, z) - FluidFieldSample(sim, sim->wNext, x, y - 1, z)) / (2.0f * sim->dyMeters);
+                sim->divergence[i] = du + dv + dw;
             }
         }
     }
@@ -2028,6 +2344,8 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
                     sim->vNext[i] = 0.0f;
                     sim->wNext[i] = 0.0f;
                     sim->buoyancy[i] = 0.0f;
+                    sim->sunlight[i] = 0.0f;
+                    sim->divergence[i] = 0.0f;
                     continue;
                 }
 
@@ -2035,6 +2353,9 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
                 float altNorm = altitude / sim->topMeters;
                 float backgroundTemp = BaseSeaLevelTemp(sim->simSeconds) - 0.0065f * altitude;
                 float basePressure = BasePressureAtAltitude(altitude);
+                float envVapor = BackgroundMixingRatio(sim->simSeconds, altNorm, backgroundTemp, basePressure);
+                float targetU = sim->prevailingU * (0.68f + 0.32f * altNorm);
+                float targetV = sim->prevailingV * (0.68f + 0.32f * altNorm);
                 float edgeDist = (float)x;
                 if ((float)(sim->nx - 1 - x) < edgeDist) edgeDist = (float)(sim->nx - 1 - x);
                 if ((float)z < edgeDist) edgeDist = (float)z;
@@ -2044,26 +2365,53 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
                 float localLayer = (float)(y - ground);
 
                 if (localLayer > 0.0f && localLayer <= 2.5f) {
-                    float exchange = Clamp(dt * (0.045f / localLayer), 0.0f, 0.65f);
+                    float nearGroundWind = sqrtf(sim->uNext[i] * sim->uNext[i] + sim->vNext[i] * sim->vNext[i]);
+                    float exchange = Clamp(dt * (0.015f + 0.012f * sqrtf(nearGroundWind + 0.5f)) / localLayer, 0.0f, 0.60f);
                     float qsatSurface = SaturationMixingRatio(sim->surfaceTemp[column], sim->pressureNext[i]);
-                    float targetVapor = Clamp(qsatSurface * (0.74f + 0.14f * solar), 0.0002f, 0.024f);
+                    float surfaceRH = Clamp(0.72f + 0.12f * (1.0f - solar) + 0.08f * (1.0f - terrainNorm), 0.45f, 0.96f);
+                    float targetVapor = Clamp(qsatSurface * surfaceRH, 0.0002f, 0.024f);
                     sim->tempNext[i] = Lerp(sim->tempNext[i], sim->surfaceTemp[column], exchange);
-                    sim->vaporNext[i] = Lerp(sim->vaporNext[i], targetVapor, exchange * (0.82f - 0.22f * terrainNorm));
+                    sim->vaporNext[i] = Lerp(sim->vaporNext[i], targetVapor, exchange * (0.86f - 0.18f * terrainNorm));
 
                     float terrainLift = sim->uNext[i] * sim->columnDx[column] + sim->vNext[i] * sim->columnDz[column];
-                    sim->wNext[i] += dt * ((fmaxf(terrainLift, 0.0f) * 1.25f) - (fmaxf(-terrainLift, 0.0f) * 0.45f)) / localLayer;
-                    sim->uNext[i] += dt * (-sim->columnDx[column] * (sim->surfaceTemp[column] - backgroundTemp) * 0.020f) / localLayer;
-                    sim->vNext[i] += dt * (-sim->columnDz[column] * (sim->surfaceTemp[column] - backgroundTemp) * 0.020f) / localLayer;
+                    float terrainLiftGain = (fmaxf(terrainLift, 0.0f) * 1.10f) - (fmaxf(-terrainLift, 0.0f) * 0.35f);
+                    sim->wNext[i] += dt * terrainLiftGain / localLayer;
+
+                    float slopeFlow = Clamp(sim->surfaceTemp[column] - backgroundTemp, -8.0f, 8.0f);
+                    sim->uNext[i] += dt * (-sim->columnDx[column] * slopeFlow * 0.015f) / localLayer;
+                    sim->vNext[i] += dt * (-sim->columnDz[column] * slopeFlow * 0.015f) / localLayer;
                 }
 
                 float avgTemp = NeighborAverage3D(sim, sim->temp, x, y, z);
                 float avgVapor = NeighborAverage3D(sim, sim->vapor, x, y, z);
-                sim->tempNext[i] += dt * 0.010f * (avgTemp - sim->tempNext[i]);
-                sim->vaporNext[i] += dt * 0.006f * (avgVapor - sim->vaporNext[i]);
+                sim->tempNext[i] += dt * 0.007f * (avgTemp - sim->tempNext[i]);
+                sim->vaporNext[i] += dt * 0.004f * (avgVapor - sim->vaporNext[i]);
 
-                float buoyancy = 0.12f * (sim->tempNext[i] - backgroundTemp) - 18.0f * sim->cloudNext[i] - 10.0f * sim->rainNext[i];
+                float windSpeed = sqrtf(sim->u[i] * sim->u[i] + sim->v[i] * sim->v[i]);
+                float instability = Clamp((sim->surfaceTemp[column] - backgroundTemp) / 10.0f, -0.8f, 1.5f);
+                float eddyDiff = 18.0f + 150.0f * (1.0f - altNorm) * (1.0f - altNorm) +
+                                 95.0f * fmaxf(instability, 0.0f) + 24.0f * Clamp(windSpeed / 12.0f, 0.0f, 1.0f);
+                float momentumDiff = eddyDiff * 0.62f;
+                float condensateDiff = eddyDiff * 0.40f;
+                sim->tempNext[i] += dt * eddyDiff * VerticalSecondDerivative(sim, sim->temp, x, y, z);
+                sim->vaporNext[i] += dt * (eddyDiff * 0.82f) * VerticalSecondDerivative(sim, sim->vapor, x, y, z);
+                sim->cloudNext[i] += dt * condensateDiff * VerticalSecondDerivative(sim, sim->cloud, x, y, z);
+                sim->rainNext[i] += dt * (condensateDiff * 0.20f) * VerticalSecondDerivative(sim, sim->rain, x, y, z);
+                sim->uNext[i] += dt * momentumDiff * VerticalSecondDerivative(sim, sim->u, x, y, z);
+                sim->vNext[i] += dt * momentumDiff * VerticalSecondDerivative(sim, sim->v, x, y, z);
+                sim->wNext[i] += dt * (momentumDiff * 0.55f) * VerticalSecondDerivative(sim, sim->w, x, y, z);
+
+                float humidBlend = Clamp(RelativeHumidity(sim->tempNext[i], fmaxf(sim->pressureNext[i], 600.0f), sim->vaporNext[i]) * 0.01f +
+                                         sim->cloudNext[i] * 140.0f, 0.0f, 1.0f);
+                float adiabaticRate = Lerp(0.0098f, 0.0060f, humidBlend);
+                sim->tempNext[i] -= dt * adiabaticRate * sim->wNext[i];
+
+                float parcelTv = VirtualTemperatureK(sim->tempNext[i], sim->vaporNext[i], sim->cloudNext[i], sim->rainNext[i]);
+                float envTv = VirtualTemperatureK(backgroundTemp, envVapor, 0.0f, 0.0f);
+                float buoyancy = 9.81f * (parcelTv - envTv) / fmaxf(envTv, 180.0f);
+                buoyancy = Clamp(buoyancy, -1.5f, 1.5f);
                 sim->buoyancy[i] = buoyancy;
-                sim->wNext[i] += dt * (buoyancy - 0.18f * sim->wNext[i]);
+                sim->wNext[i] += dt * (buoyancy - (0.10f + 0.12f * topBlend) * sim->wNext[i]);
 
                 int xm = (x > 0) ? x - 1 : x;
                 int xp = (x + 1 < sim->nx) ? x + 1 : x;
@@ -2075,36 +2423,49 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
                 float div = (sim->uNext[AtmosIndex(sim, xp, y, z)] - sim->uNext[AtmosIndex(sim, xm, y, z)]) / (2.0f * sim->dxMeters) +
                             (sim->vNext[AtmosIndex(sim, x, y, zp)] - sim->vNext[AtmosIndex(sim, x, y, zm)]) / (2.0f * sim->dzMeters) +
                             (sim->wNext[AtmosIndex(sim, x, yp, z)] - sim->wNext[AtmosIndex(sim, x, ym, z)]) / (2.0f * sim->dyMeters);
-                sim->pressureNext[i] += dt * (-280.0f * div - 0.09f * (sim->pressureNext[i] - basePressure));
+                sim->divergence[i] = div;
+                float pressureAnomaly = sim->pressureNext[i] - basePressure;
+                sim->pressureNext[i] += dt * (-220.0f * div - 0.055f * pressureAnomaly);
+                sim->pressureNext[i] = Clamp(sim->pressureNext[i], 520.0f, 1025.0f);
 
-                float gradPx = (sim->pressureNext[AtmosIndex(sim, xp, y, z)] - sim->pressureNext[AtmosIndex(sim, xm, y, z)]) / (2.0f * sim->dxMeters);
-                float gradPz = (sim->pressureNext[AtmosIndex(sim, x, y, zp)] - sim->pressureNext[AtmosIndex(sim, x, y, zm)]) / (2.0f * sim->dzMeters);
-                float gradPy = (sim->pressureNext[AtmosIndex(sim, x, yp, z)] - sim->pressureNext[AtmosIndex(sim, x, ym, z)]) / (2.0f * sim->dyMeters);
-                float drag = 0.028f + 0.012f * Clamp(sim->columnSlope[column] * 2.0f, 0.0f, 1.0f) + 0.016f * topBlend;
-                sim->uNext[i] += dt * (-44.0f * gradPx - drag * sim->uNext[i]);
-                sim->vNext[i] += dt * (-44.0f * gradPz - drag * sim->vNext[i]);
-                sim->wNext[i] += dt * (-15.0f * gradPy - (0.18f + 0.18f * topBlend) * sim->wNext[i]);
+                float gradPx = (PressureAnomalySample(sim, sim->pressureNext, xp, y, z) -
+                                PressureAnomalySample(sim, sim->pressureNext, xm, y, z)) / (2.0f * sim->dxMeters);
+                float gradPz = (PressureAnomalySample(sim, sim->pressureNext, x, y, zp) -
+                                PressureAnomalySample(sim, sim->pressureNext, x, y, zm)) / (2.0f * sim->dzMeters);
+                float gradPy = (PressureAnomalySample(sim, sim->pressureNext, x, yp, z) -
+                                PressureAnomalySample(sim, sim->pressureNext, x, ym, z)) / (2.0f * sim->dyMeters);
+                float density = Clamp((sim->pressureNext[i] * 100.0f) / (287.05f * fmaxf(parcelTv, 180.0f)), 0.55f, 1.40f);
+                float drag = 0.016f + 0.020f * Clamp(sim->columnSlope[column] * 2.2f, 0.0f, 1.0f) + 0.018f * topBlend;
+                float geostrophicRelax = 0.008f + 0.008f * edgeBlend;
+                sim->uNext[i] += dt * (-(100.0f / density) * gradPx - drag * sim->uNext[i] + geostrophicRelax * (targetU - sim->uNext[i]));
+                sim->vNext[i] += dt * (-(100.0f / density) * gradPz - drag * sim->vNext[i] + geostrophicRelax * (targetV - sim->vNext[i]));
+                sim->wNext[i] += dt * (-(72.0f / density) * gradPy - (0.12f + 0.12f * topBlend) * sim->wNext[i]);
 
                 float qsat = SaturationMixingRatio(sim->tempNext[i], sim->pressureNext[i]);
+                float relHum = Clamp(sim->vaporNext[i] / fmaxf(qsat, 0.000001f), 0.0f, 1.60f);
                 float supersat = sim->vaporNext[i] - qsat;
                 if (supersat > 0.0f) {
-                    float condense = supersat * Clamp(dt * (0.24f + 0.14f * Clamp(sim->wNext[i], 0.0f, 4.0f)), 0.0f, 0.95f);
+                    float condense = supersat * Clamp(dt * (0.14f + 0.12f * Clamp(sim->wNext[i], 0.0f, 4.0f) + 0.06f * relHum), 0.0f, 0.88f);
                     sim->vaporNext[i] -= condense;
                     sim->cloudNext[i] += condense;
-                    sim->tempNext[i] += condense * 2300.0f;
+                    sim->tempNext[i] += condense * 2480.0f;
                 } else {
                     float deficit = -supersat;
-                    float evapCloud = fminf(sim->cloudNext[i], deficit * Clamp(dt * 0.11f, 0.0f, 0.65f));
-                    float evapRain = fminf(sim->rainNext[i], deficit * Clamp(dt * 0.05f, 0.0f, 0.45f));
+                    float dryAir = Clamp(1.0f - relHum, 0.0f, 1.0f);
+                    float evapCloud = fminf(sim->cloudNext[i], deficit * Clamp(dt * (0.04f + 0.08f * dryAir), 0.0f, 0.45f));
+                    float evapRain = fminf(sim->rainNext[i], deficit * Clamp(dt * (0.02f + 0.10f * dryAir + 0.04f * Clamp(-sim->wNext[i], 0.0f, 3.0f)), 0.0f, 0.35f));
                     sim->cloudNext[i] -= evapCloud;
                     sim->rainNext[i] -= evapRain;
                     sim->vaporNext[i] += evapCloud + evapRain;
-                    sim->tempNext[i] -= evapCloud * 900.0f + evapRain * 650.0f;
+                    sim->tempNext[i] -= (evapCloud + evapRain) * 2450.0f;
                 }
 
-                float autoRain = fmaxf(sim->cloudNext[i] - 0.00055f, 0.0f) * Clamp(dt * 0.34f, 0.0f, 0.76f);
-                sim->cloudNext[i] -= autoRain;
-                sim->rainNext[i] += autoRain;
+                float cloudThreshold = 0.00035f + 0.00020f * altNorm;
+                float autoRain = fmaxf(sim->cloudNext[i] - cloudThreshold, 0.0f) *
+                                 Clamp(dt * (0.09f + 0.05f * Clamp(sim->rainNext[i] * 900.0f, 0.0f, 1.0f)), 0.0f, 0.40f);
+                float accretion = fminf(fmaxf(sim->cloudNext[i] - autoRain, 0.0f), sim->cloudNext[i] * sim->rainNext[i] * dt * 90.0f);
+                sim->cloudNext[i] -= autoRain + accretion;
+                sim->rainNext[i] += autoRain + accretion;
 
                 if ((y - ground) == 1) {
                     sim->surfaceRain[column] += sim->rainNext[i] * 850000.0f;
@@ -2115,11 +2476,12 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
                     relax = Clamp(relax, 0.0f, 0.90f);
                     sim->tempNext[i] = Lerp(sim->tempNext[i], backgroundTemp, relax);
                     sim->pressureNext[i] = Lerp(sim->pressureNext[i], basePressure, relax);
-                    sim->vaporNext[i] = Lerp(sim->vaporNext[i], qsat * (0.52f + 0.20f * (1.0f - altNorm)), relax * 0.8f);
-                    sim->uNext[i] = Lerp(sim->uNext[i], sim->prevailingU, relax);
-                    sim->vNext[i] = Lerp(sim->vNext[i], sim->prevailingV, relax);
+                    sim->vaporNext[i] = Lerp(sim->vaporNext[i], envVapor, relax * 0.85f);
+                    sim->uNext[i] = Lerp(sim->uNext[i], targetU, relax);
+                    sim->vNext[i] = Lerp(sim->vNext[i], targetV, relax);
                     sim->wNext[i] *= (1.0f - relax);
                     sim->cloudNext[i] *= (1.0f - relax * 0.35f);
+                    sim->rainNext[i] *= (1.0f - relax * 0.25f);
                 }
 
                 sim->tempNext[i] = Clamp(sim->tempNext[i], -42.0f, 34.0f);
@@ -2134,9 +2496,38 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
         }
     }
 
+    ProjectVelocityField(sim, dt);
+
+    for (int z = 0; z < sim->nz; z++) {
+        for (int x = 0; x < sim->nx; x++) {
+            float incoming = solar;
+            for (int y = sim->ny - 1; y >= 0; y--) {
+                int i = AtmosIndex(sim, x, y, z);
+                if (!IsFluidCell(sim, x, y, z)) {
+                    sim->sunlight[i] = 0.0f;
+                    continue;
+                }
+
+                float altNorm = CellAltitudeMeters(sim, y) / sim->topMeters;
+                float opticalDepth = sim->cloudNext[i] * 175.0f + sim->rainNext[i] * 120.0f + sim->vaporNext[i] * 4.0f;
+                float transmission = Clamp(expf(-opticalDepth * sim->dyMeters * 0.00016f), 0.03f, 1.0f);
+                float absorbed = incoming * (1.0f - transmission);
+                float greenhouse = Clamp(sim->cloudNext[i] * 170.0f + sim->vaporNext[i] * 14.0f, 0.0f, 0.95f);
+
+                sim->sunlight[i] = incoming;
+                sim->tempNext[i] += dt * (absorbed * (0.12f + 0.06f * (1.0f - altNorm)) -
+                                          (0.0007f + 0.0011f * (1.0f - greenhouse) + 0.0004f * altNorm));
+                incoming *= transmission;
+            }
+        }
+    }
+
     for (int i = 0; i < sim->cells3D; i++) {
         sim->tempNext[i] = Clamp(sim->tempNext[i], -45.0f, 36.0f);
         sim->pressureNext[i] = Clamp(sim->pressureNext[i], 520.0f, 1030.0f);
+        sim->vaporNext[i] = Clamp(sim->vaporNext[i], 0.00001f, 0.030f);
+        sim->cloudNext[i] = Clamp(sim->cloudNext[i], 0.0f, 0.0060f);
+        sim->rainNext[i] = Clamp(sim->rainNext[i], 0.0f, 0.010f);
         sim->uNext[i] = Clamp(sim->uNext[i], -35.0f, 35.0f);
         sim->vNext[i] = Clamp(sim->vNext[i], -35.0f, 35.0f);
         sim->wNext[i] = Clamp(sim->wNext[i], -10.0f, 10.0f);
@@ -2154,11 +2545,45 @@ static void StepAtmosphere(AtmosphereSim *sim, float dt) {
     sim->simSeconds += dt;
 }
 
+static float EstimateStableStepSeconds(const AtmosphereSim *sim) {
+    float maxU = 1.0f;
+    float maxV = 1.0f;
+    float maxW = 1.0f;
+
+    for (int z = 0; z < sim->nz; z++) {
+        for (int y = 0; y < sim->ny; y++) {
+            for (int x = 0; x < sim->nx; x++) {
+                if (!IsFluidCell(sim, x, y, z)) continue;
+
+                int i = AtmosIndex(sim, x, y, z);
+                float u = fabsf(sim->u[i]);
+                float v = fabsf(sim->v[i]);
+                float w = fabsf(sim->w[i]);
+                if (u > maxU) maxU = u;
+                if (v > maxV) maxV = v;
+                if (w > maxW) maxW = w;
+            }
+        }
+    }
+
+    float dtX = 0.34f * sim->dxMeters / maxU;
+    float dtZ = 0.34f * sim->dzMeters / maxV;
+    float dtY = 0.28f * sim->dyMeters / (maxW + 6.0f);
+    float stableDt = fminf(dtX, fminf(dtY, dtZ));
+    return Clamp(stableDt, 0.6f, MAX_STEP_SECONDS);
+}
+
 static void UpdateAtmosphere(AtmosphereSim *sim, float frameDt) {
     float simulated = Clamp(frameDt, 0.0f, 0.05f) * sim->timeScale;
-    int steps = (int)ceilf(simulated / MAX_STEP_SECONDS);
+    if (simulated <= 0.00001f) {
+        UpdateStats(sim);
+        return;
+    }
+
+    float stableDt = EstimateStableStepSeconds(sim);
+    int steps = (int)ceilf(simulated / stableDt);
     if (steps < 1) steps = 1;
-    if (steps > 4) steps = 4;
+    if (steps > 8) steps = 8;
     float dt = simulated / (float)steps;
 
     for (int i = 0; i < steps; i++) StepAtmosphere(sim, dt);
@@ -2281,19 +2706,19 @@ static Color FieldColorFromValue(const AtmosphereSim *sim, FieldMode mode, float
         case FIELD_TEMPERATURE:
             return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
         case FIELD_PRESSURE:
-            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
+            return RampColor(t, kPressureStops, (int)(sizeof(kPressureStops) / sizeof(kPressureStops[0])));
         case FIELD_REL_HUMIDITY:
             return RampColor(t, kHumidityStops, (int)(sizeof(kHumidityStops) / sizeof(kHumidityStops[0])));
         case FIELD_DEWPOINT:
-            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
+            return RampColor(t, kDewPointStops, (int)(sizeof(kDewPointStops) / sizeof(kDewPointStops[0])));
         case FIELD_VAPOR:
-            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
+            return RampColor(t, kVaporStops, (int)(sizeof(kVaporStops) / sizeof(kVaporStops[0])));
         case FIELD_CLOUD:
             return RampColor(t, kCloudStops, (int)(sizeof(kCloudStops) / sizeof(kCloudStops[0])));
         case FIELD_RAIN:
-            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
+            return RampColor(t, kRainStops, (int)(sizeof(kRainStops) / sizeof(kRainStops[0])));
         case FIELD_WIND:
-            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
+            return RampColor(t, kWindStops, (int)(sizeof(kWindStops) / sizeof(kWindStops[0])));
         case FIELD_VERTICAL_WIND:
             return RampColor(t, kDivergingStops, (int)(sizeof(kDivergingStops) / sizeof(kDivergingStops[0])));
         case FIELD_BUOYANCY:
@@ -2405,7 +2830,7 @@ static void UpdateVolumeFieldTexture(AtmosphereSim *sim) {
 
     int atlasWidth = sim->nx * sim->volumeAtlasCols;
     int atlasHeight = sim->nz * sim->volumeAtlasRows;
-    memset(sim->volumeFieldPixels, 0, (size_t)atlasWidth * (size_t)atlasHeight * sizeof(Color));
+    memset(sim->volumeFieldPixels, 0, (size_t)atlasWidth * (size_t)atlasHeight * sizeof(Vector4));
 
     for (int y = 0; y < sim->ny; y++) {
         int tileX = y % sim->volumeAtlasCols;
@@ -2418,21 +2843,45 @@ static void UpdateVolumeFieldTexture(AtmosphereSim *sim) {
                 int dst = atlasY * atlasWidth + atlasX;
 
                 if (!IsFluidCell(sim, x, y, z)) {
-                    sim->volumeFieldPixels[dst] = BLANK;
+                    sim->volumeFieldPixels[dst] = (Vector4) { 0.0f, 0.0f, 0.0f, 0.0f };
                     continue;
                 }
 
-                int i = AtmosIndex(sim, x, y, z);
-                float cloudNorm = NormalizeRange(sim->cloud[i] * 1000.0f, 0.0f, 3.0f);
-                float rainNorm = NormalizeRange(sim->rain[i] * 1000.0f, 0.0f, 5.0f);
-                float lightNorm = Clamp(sim->sunlight[i], 0.0f, 1.0f);
-                float tempNorm = NormalizeRange(sim->temp[i], -30.0f, 24.0f);
-                sim->volumeFieldPixels[dst] = (Color) {
-                    (unsigned char)(255.0f * cloudNorm),
-                    (unsigned char)(255.0f * rainNorm),
-                    (unsigned char)(255.0f * lightNorm),
-                    (unsigned char)(255.0f * tempNorm)
-                };
+                float sx = (float)x;
+                float sy = (float)y;
+                float sz = (float)z;
+                float cloudSmooth =
+                    SampleAtmosField(sim, sim->cloud, sx, sy, sz) * 0.28f +
+                    SampleAtmosField(sim, sim->cloud, sx, sy - 0.75f, sz) * 0.15f +
+                    SampleAtmosField(sim, sim->cloud, sx, sy + 0.75f, sz) * 0.15f +
+                    SampleAtmosField(sim, sim->cloud, sx - 0.65f, sy, sz) * 0.10f +
+                    SampleAtmosField(sim, sim->cloud, sx + 0.65f, sy, sz) * 0.10f +
+                    SampleAtmosField(sim, sim->cloud, sx, sy, sz - 0.65f) * 0.07f +
+                    SampleAtmosField(sim, sim->cloud, sx, sy, sz + 0.65f) * 0.07f +
+                    SampleAtmosField(sim, sim->cloud, sx - 0.75f, sy, sz - 0.75f) * 0.02f +
+                    SampleAtmosField(sim, sim->cloud, sx + 0.75f, sy, sz - 0.75f) * 0.02f +
+                    SampleAtmosField(sim, sim->cloud, sx - 0.75f, sy, sz + 0.75f) * 0.02f +
+                    SampleAtmosField(sim, sim->cloud, sx + 0.75f, sy, sz + 0.75f) * 0.02f;
+                float rainSmooth =
+                    SampleAtmosField(sim, sim->rain, sx, sy, sz) * 0.48f +
+                    SampleAtmosField(sim, sim->rain, sx, sy - 0.80f, sz) * 0.18f +
+                    SampleAtmosField(sim, sim->rain, sx, sy + 0.60f, sz) * 0.14f +
+                    SampleAtmosField(sim, sim->rain, sx - 0.55f, sy, sz) * 0.10f +
+                    SampleAtmosField(sim, sim->rain, sx + 0.55f, sy, sz) * 0.10f;
+                float lightSmooth =
+                    SampleAtmosField(sim, sim->sunlight, sx, sy, sz) * 0.52f +
+                    SampleAtmosField(sim, sim->sunlight, sx, sy + 0.75f, sz) * 0.28f +
+                    SampleAtmosField(sim, sim->sunlight, sx, sy - 0.75f, sz) * 0.20f;
+                float tempSmooth =
+                    SampleAtmosField(sim, sim->temp, sx, sy, sz) * 0.54f +
+                    SampleAtmosField(sim, sim->temp, sx, sy - 0.80f, sz) * 0.23f +
+                    SampleAtmosField(sim, sim->temp, sx, sy + 0.80f, sz) * 0.23f;
+
+                float cloudNorm = NormalizeRange(cloudSmooth * 1000.0f, 0.0f, 3.0f);
+                float rainNorm = NormalizeRange(rainSmooth * 1000.0f, 0.0f, 5.0f);
+                float lightNorm = Clamp(lightSmooth, 0.0f, 1.0f);
+                float tempNorm = NormalizeRange(tempSmooth, -30.0f, 24.0f);
+                sim->volumeFieldPixels[dst] = (Vector4) { cloudNorm, rainNorm, lightNorm, tempNorm };
             }
         }
     }
@@ -2443,6 +2892,7 @@ static void UpdateVolumeFieldTexture(AtmosphereSim *sim) {
 static void UpdateSliceTextures(AtmosphereSim *sim) {
     if (sim->showHorizontalSlice) UpdateHorizontalSliceTexture(sim);
     if (sim->showVerticalSlice) UpdateVerticalSliceTexture(sim);
+    if (sim->showClouds) UpdateVolumeFieldTexture(sim);
 }
 
 static Color SkyColor(const AtmosphereSim *sim) {
@@ -2455,6 +2905,37 @@ static Color SkyColor(const AtmosphereSim *sim) {
     Color base = (sun > 0.07f) ? LerpColor(dawn, noon, sun) : LerpColor(night, dawn, sun * 7.5f);
     float overcastMix = Clamp(sim->maxCloud * 210.0f, 0.0f, 0.55f);
     return LerpColor(base, overcast, overcastMix);
+}
+
+static void DrawAtmosphereBackground(const AtmosphereSim *sim, const Camera3D *camera) {
+    if (sim->skyShader.id == 0) {
+        ClearBackground(SkyColor(sim));
+        return;
+    }
+
+    Vector3 forward = Vector3Normalize(Vector3Subtract(camera->target, camera->position));
+    Vector3 right = Vector3Normalize(Vector3CrossProduct(forward, camera->up));
+    Vector3 up = Vector3Normalize(Vector3CrossProduct(right, forward));
+    float aspect = (float)GetScreenWidth() / fmaxf((float)GetScreenHeight(), 1.0f);
+    float tanHalfFov = tanf(camera->fovy * DEG2RAD * 0.5f);
+    float sunDir[3] = { sim->sunDir.x, sim->sunDir.y, sim->sunDir.z };
+    float camRight[3] = { right.x, right.y, right.z };
+    float camUp[3] = { up.x, up.y, up.z };
+    float camForward[3] = { forward.x, forward.y, forward.z };
+    float sunStrength = Clamp(sim->solarStrength, 0.0f, 1.0f);
+
+    ClearBackground(BLACK);
+    SetShaderValue(sim->skyShader, sim->skyLocSunDir, sunDir, SHADER_UNIFORM_VEC3);
+    SetShaderValue(sim->skyShader, sim->skyLocCamRight, camRight, SHADER_UNIFORM_VEC3);
+    SetShaderValue(sim->skyShader, sim->skyLocCamUp, camUp, SHADER_UNIFORM_VEC3);
+    SetShaderValue(sim->skyShader, sim->skyLocCamForward, camForward, SHADER_UNIFORM_VEC3);
+    SetShaderValue(sim->skyShader, sim->skyLocAspect, &aspect, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(sim->skyShader, sim->skyLocTanHalfFov, &tanHalfFov, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(sim->skyShader, sim->skyLocSunStrength, &sunStrength, SHADER_UNIFORM_FLOAT);
+
+    BeginShaderMode(sim->skyShader);
+    DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), WHITE);
+    EndShaderMode();
 }
 
 static ImU32 ImGuiColorU32(Color color, float alphaScale) {
@@ -2522,9 +3003,24 @@ static void DrawFieldLegendHud(const AtmosphereSim *sim, FieldMode mode) {
     igDummy(ImVec2Make(legendWidth, legendHeight + labelHeight + 8.0f));
 }
 
+static void DrawWindArrowGlyph(Vector3 start, Vector3 tip, unsigned char alpha) {
+    Vector3 delta = Vector3Subtract(tip, start);
+    float length = Vector3Length(delta);
+    if (length <= 0.08f) return;
+
+    float headLength = fminf(WIND_ARROW_HEAD_LENGTH, length * 0.45f);
+    Vector3 dir = Vector3Scale(delta, 1.0f / length);
+    Vector3 shaftEnd = Vector3Add(start, Vector3Scale(dir, length - headLength));
+    Color shaftColor = (Color) { 242, 58, 58, alpha };
+    Color headColor = (Color) { 255, 90, 90, alpha };
+
+    DrawCylinderEx(start, shaftEnd, WIND_ARROW_SHAFT_RADIUS, WIND_ARROW_SHAFT_RADIUS * 0.88f, 7, shaftColor);
+    DrawCylinderEx(shaftEnd, tip, WIND_ARROW_HEAD_RADIUS, 0.0f, 7, headColor);
+}
+
 static void DrawWindArrowsOnHorizontalSlice(const AtmosphereSim *sim) {
     int layer = Clamp(sim->horizontalLayer, 0, sim->ny - 1);
-    float y = WorldYFromMeters(CellAltitudeMeters(sim, layer));
+    float y = WorldYFromMeters(CellAltitudeMeters(sim, layer)) + 0.08f;
 
     for (int z = 0; z < sim->nz; z += HSLICE_ARROW_STEP) {
         for (int x = 0; x < sim->nx; x += HSLICE_ARROW_STEP) {
@@ -2535,12 +3031,11 @@ static void DrawWindArrowsOnHorizontalSlice(const AtmosphereSim *sim) {
 
             Vector3 start = { (float)x * sim->dxWorld, y, (float)z * sim->dzWorld };
             Vector3 tip = {
-                start.x + sim->u[i] * 0.24f,
-                start.y + sim->w[i] * 0.16f,
-                start.z + sim->v[i] * 0.24f
+                start.x + sim->u[i] * WIND_ARROW_SCALE,
+                start.y + sim->w[i] * (WIND_ARROW_SCALE * 0.72f),
+                start.z + sim->v[i] * WIND_ARROW_SCALE
             };
-            Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, sim->u[i], sim->v[i]), 220);
-            DrawLine3D(start, tip, color);
+            DrawWindArrowGlyph(start, tip, 228);
         }
     }
 }
@@ -2556,10 +3051,13 @@ static void DrawWindArrowsOnVerticalSlice(const AtmosphereSim *sim) {
                 int i = AtmosIndex(sim, slice, y, z);
                 float speed = sqrtf(sim->v[i] * sim->v[i] + sim->w[i] * sim->w[i]);
                 if (speed < 0.8f) continue;
-                Vector3 start = { xWorld, WorldYFromMeters(CellAltitudeMeters(sim, y)), (float)z * sim->dzWorld };
-                Vector3 tip = { start.x, start.y + sim->w[i] * 0.20f, start.z + sim->v[i] * 0.22f };
-                Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, 0.0f, sim->v[i]), 220);
-                DrawLine3D(start, tip, color);
+                Vector3 start = { xWorld + 0.08f, WorldYFromMeters(CellAltitudeMeters(sim, y)), (float)z * sim->dzWorld };
+                Vector3 tip = {
+                    start.x,
+                    start.y + sim->w[i] * (WIND_ARROW_SCALE * 0.90f),
+                    start.z + sim->v[i] * WIND_ARROW_SCALE
+                };
+                DrawWindArrowGlyph(start, tip, 228);
             }
         }
     } else {
@@ -2570,10 +3068,13 @@ static void DrawWindArrowsOnVerticalSlice(const AtmosphereSim *sim) {
                 int i = AtmosIndex(sim, x, y, slice);
                 float speed = sqrtf(sim->u[i] * sim->u[i] + sim->w[i] * sim->w[i]);
                 if (speed < 0.8f) continue;
-                Vector3 start = { (float)x * sim->dxWorld, WorldYFromMeters(CellAltitudeMeters(sim, y)), zWorld };
-                Vector3 tip = { start.x + sim->u[i] * 0.22f, start.y + sim->w[i] * 0.20f, start.z };
-                Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, sim->u[i], 0.0f), 220);
-                DrawLine3D(start, tip, color);
+                Vector3 start = { (float)x * sim->dxWorld, WorldYFromMeters(CellAltitudeMeters(sim, y)), zWorld + 0.08f };
+                Vector3 tip = {
+                    start.x + sim->u[i] * WIND_ARROW_SCALE,
+                    start.y + sim->w[i] * (WIND_ARROW_SCALE * 0.90f),
+                    start.z
+                };
+                DrawWindArrowGlyph(start, tip, 228);
             }
         }
     }
@@ -2582,6 +3083,7 @@ static void DrawWindArrowsOnVerticalSlice(const AtmosphereSim *sim) {
 static void DrawCloudVolume(const AtmosphereSim *sim, Camera camera) {
     if (!sim->showClouds) return;
     if (sim->cloudVolumeShader.id == 0 || sim->volumeFieldTex.id == 0 || sim->cloudVolumeModel.meshCount == 0) return;
+    if (sim->cloudTerrainTex.id == 0) return;
 
     float volumeMin[3] = { 0.0f, 0.0f, 0.0f };
     float volumeMax[3] = { sim->worldWidth, sim->topWorldY, sim->worldDepth };
@@ -2592,7 +3094,7 @@ static void DrawCloudVolume(const AtmosphereSim *sim, Camera camera) {
         sim->cloudDensityScale,
         NormalizeRange(sim->cloudRenderThreshold, 0.0f, 3.0f),
         sim->cloudRenderAlpha,
-        sim->solarStrength
+        1.0f
     };
     float sunDir[3] = { sim->sunDir.x, sim->sunDir.y, sim->sunDir.z };
 
@@ -2606,12 +3108,14 @@ static void DrawCloudVolume(const AtmosphereSim *sim, Camera camera) {
 
     rlDisableBackfaceCulling();
     rlSetBlendMode(BLEND_ALPHA);
+    rlDisableDepthMask();
 
     DrawModel(sim->cloudVolumeModel,
               (Vector3) { sim->worldWidth * 0.5f, sim->topWorldY * 0.5f, sim->worldDepth * 0.5f },
               1.0f,
               WHITE);
 
+    rlEnableDepthMask();
     rlEnableBackfaceCulling();
 }
 
@@ -2637,14 +3141,12 @@ static void DrawVolumeField3D(const AtmosphereSim *sim) {
                         (float)z * sim->dzWorld
                     };
                     Vector3 tip = {
-                        start.x + sim->u[i] * 0.22f,
-                        start.y + sim->w[i] * 0.18f,
-                        start.z + sim->v[i] * 0.22f
+                        start.x + sim->u[i] * WIND_ARROW_SCALE,
+                        start.y + sim->w[i] * (WIND_ARROW_SCALE * 0.72f),
+                        start.z + sim->v[i] * WIND_ARROW_SCALE
                     };
                     unsigned char alpha = (unsigned char)(255.0f * Clamp(sim->volumeAlpha * weight, 0.12f, 0.90f));
-                    Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, sim->u[i], sim->v[i]), alpha);
-                    DrawLine3D(start, tip, color);
-                    DrawSphereEx(tip, 0.28f + 0.18f * weight, 4, 4, color);
+                    DrawWindArrowGlyph(start, tip, alpha);
                 }
             }
         }
@@ -2803,8 +3305,16 @@ static bool DrawImGuiControls(AtmosphereSim *sim) {
                     igCheckbox("Show terrain", &sim->showTerrain);
                     igCheckbox("Wireframe terrain", &sim->showWireframe);
                     igCheckbox("Show wind vectors", &sim->showWindArrows);
+                    igCheckbox("Render clouds", &sim->showClouds);
                     igBeginDisabled(!sim->showTerrain);
                     DrawLabeledSliderFloat("Terrain opacity", "##TerrainOpacity", &sim->terrainAlpha, 0.05f, 1.0f, "%.2f");
+                    igEndDisabled();
+
+                    igSeparatorText("Clouds");
+                    igBeginDisabled(!sim->showClouds);
+                    DrawLabeledSliderFloat("Cloud opacity", "##CloudOpacity", &sim->cloudRenderAlpha, 0.20f, 0.95f, "%.2f");
+                    DrawLabeledSliderFloat("Cloud density", "##CloudDensity", &sim->cloudDensityScale, 0.50f, 1.80f, "%.2f");
+                    DrawLabeledSliderFloat("Cloud threshold", "##CloudThreshold", &sim->cloudRenderThreshold, 0.00f, 0.30f, "%.2f");
                     igEndDisabled();
 
                     igSeparatorText("Slices");
@@ -2844,6 +3354,7 @@ static bool DrawImGuiControls(AtmosphereSim *sim) {
                     igBulletText("Space: pause");
                     igBulletText("R: reset weather");
                     igBulletText("Tab: cycle field");
+                    igBulletText("C: toggle clouds");
                     igBulletText("H / J: toggle slices");
                     igBulletText("T: toggle terrain");
                     igBulletText("G: hide or show panel");
@@ -2940,6 +3451,9 @@ static bool RebuildGeneratedTerrain(AtmosphereSim *sim) {
     }
 
     BuildAtmosColumns(sim);
+    if (!UpdateCloudTerrainTexture(sim)) {
+        return false;
+    }
     ResetAtmosphere(sim);
     if (preserveViewSettings) {
         RestoreSimViewSettings(sim, &viewSettings);
@@ -2992,6 +3506,7 @@ int main(int argc, char **argv) {
 
     while (!WindowShouldClose()) {
         float frameDt = GetFrameTime();
+        sim.frameCounter++;
         Rectangle panel = GetControlPanelRect();
         Rectangle uiButton = GetUiToggleRect();
         Vector2 mousePosition = GetMousePosition();
@@ -3019,6 +3534,7 @@ int main(int argc, char **argv) {
         if (!blockShortcuts && IsKeyPressed(KEY_SPACE)) sim.paused = !sim.paused;
         if (!blockShortcuts && IsKeyPressed(KEY_R)) ResetAtmosphere(&sim);
         if (!blockShortcuts && IsKeyPressed(KEY_TAB)) sim.fieldMode = (FieldMode)((sim.fieldMode + 1) % FIELD_COUNT);
+        if (!blockShortcuts && IsKeyPressed(KEY_C)) sim.showClouds = !sim.showClouds;
         if (!blockShortcuts && IsKeyPressed(KEY_H)) sim.showHorizontalSlice = !sim.showHorizontalSlice;
         if (!blockShortcuts && IsKeyPressed(KEY_J)) sim.showVerticalSlice = !sim.showVerticalSlice;
         if (!blockShortcuts && IsKeyPressed(KEY_T)) sim.showTerrain = !sim.showTerrain;
@@ -3041,6 +3557,7 @@ int main(int argc, char **argv) {
         BeginMode3D(camera);
         if (sim.showTerrain) DrawModel(sim.terrainModel, (Vector3) { 0.0f, 0.0f, 0.0f }, 1.0f, Fade(WHITE, sim.terrainAlpha));
         if (sim.showWireframe) DrawModelWires(sim.terrainModel, (Vector3) { 0.0f, 0.0f, 0.0f }, 1.0f, Fade(BLACK, 0.25f));
+        DrawCloudVolume(&sim, camera);
         DrawSlices3D(&sim, camera);
         EndMode3D();
 
