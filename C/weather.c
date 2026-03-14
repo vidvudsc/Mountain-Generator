@@ -27,6 +27,9 @@
 #define HSLICE_ARROW_STEP 8
 #define VSLICE_ARROW_STEP 4
 
+#define TERRAIN_GEN_SIZE 256
+#define TERRAIN_GEN_HEIGHT_WORLD 80.0f
+
 typedef enum FieldMode {
     FIELD_TEMPERATURE = 0,
     FIELD_PRESSURE,
@@ -77,6 +80,27 @@ typedef struct TerrainGrid {
     float *terrainDz;
     float *terrainSlope;
 } TerrainGrid;
+
+typedef struct TerrainGenSettings {
+    int seed;
+    float frequency;
+    float amplitude;
+    float heightPower;
+    int octaves;
+    float lacunarity;
+    float persistence;
+    int droplets;
+    int lifetime;
+    float inertia;
+    float capacity;
+    float minSlope;
+    float erodeRate;
+    float depositRate;
+    float evaporate;
+    float maxStep;
+    int smoothPasses;
+    float rockThreshold;
+} TerrainGenSettings;
 
 typedef struct AtmosphereSim {
     TerrainGrid terrain;
@@ -184,7 +208,42 @@ typedef struct AtmosphereSim {
     float maxCloud;
     float maxRain;
     float maxWind;
+    float fieldDisplayMin[FIELD_COUNT];
+    float fieldDisplayMax[FIELD_COUNT];
+
+    TerrainGenSettings terrainGen;
+    int activeControlTab;
 } AtmosphereSim;
+
+static bool RebuildGeneratedTerrain(AtmosphereSim *sim);
+
+typedef struct SimViewSettings {
+    FieldMode fieldMode;
+    SliceAxis verticalAxis;
+    int horizontalLayer;
+    int verticalSlice;
+    bool showHorizontalSlice;
+    bool showVerticalSlice;
+    bool showTerrain;
+    bool showWireframe;
+    bool showWindArrows;
+    bool showClouds;
+    bool showVolume;
+    bool paused;
+    bool showUI;
+    float terrainAlpha;
+    float cloudRenderAlpha;
+    float cloudRenderThreshold;
+    float cloudDensityScale;
+    float timeScale;
+    float volumeThreshold;
+    float volumeAlpha;
+    int volumeStride;
+    int activeControlTab;
+} SimViewSettings;
+
+static void FieldRange(FieldMode mode, float *outMin, float *outMax);
+static float FieldDisplayValue(const AtmosphereSim *sim, int x, int y, int z, FieldMode mode);
 
 static float Fract(float value) {
     return value - floorf(value);
@@ -252,6 +311,52 @@ static Color HSVToColor(float hue, float saturation, float value) {
         255
     };
 }
+
+static Color RampColor(float t, const Color *stops, int stopCount) {
+    t = Clamp(t, 0.0f, 1.0f);
+    if (stopCount <= 1) return stops[0];
+
+    float scaled = t * (float)(stopCount - 1);
+    int index = (int)floorf(scaled);
+    if (index >= stopCount - 1) return stops[stopCount - 1];
+
+    float localT = scaled - (float)index;
+    return LerpColor(stops[index], stops[index + 1], localT);
+}
+
+static const Color kSpectralStops[] = {
+    { 44, 18, 84, 255 },
+    { 59, 82, 184, 255 },
+    { 47, 180, 222, 255 },
+    { 92, 214, 112, 255 },
+    { 248, 231, 80, 255 },
+    { 242, 135, 39, 255 },
+    { 197, 48, 44, 255 }
+};
+
+static const Color kHumidityStops[] = {
+    { 110, 72, 34, 255 },
+    { 161, 136, 70, 255 },
+    { 79, 179, 153, 255 },
+    { 96, 198, 228, 255 },
+    { 232, 246, 255, 255 }
+};
+
+static const Color kCloudStops[] = {
+    { 18, 26, 48, 255 },
+    { 69, 70, 138, 255 },
+    { 141, 112, 194, 255 },
+    { 226, 205, 242, 255 },
+    { 248, 250, 255, 255 }
+};
+
+static const Color kDivergingStops[] = {
+    { 190, 82, 40, 255 },
+    { 239, 206, 118, 255 },
+    { 237, 241, 244, 255 },
+    { 96, 195, 227, 255 },
+    { 35, 79, 196, 255 }
+};
 
 static Texture2D CreateCloudBillboardTexture(void) {
     const int size = 128;
@@ -624,6 +729,315 @@ static void ComputeTerrainDerivatives(TerrainGrid *terrain) {
     }
 }
 
+static int TerrainGenIndex(int x, int z) {
+    return z * TERRAIN_GEN_SIZE + x;
+}
+
+static void DefaultTerrainGenSettings(TerrainGenSettings *settings, int seed) {
+    settings->seed = (seed <= 0) ? 1337 : seed;
+    settings->frequency = 0.004f;
+    settings->amplitude = 1.0f;
+    settings->heightPower = 1.5f;
+    settings->octaves = 4;
+    settings->lacunarity = 1.9f;
+    settings->persistence = 0.5f;
+    settings->droplets = 700000;
+    settings->lifetime = 24;
+    settings->inertia = 0.02f;
+    settings->capacity = 2.0f;
+    settings->minSlope = 0.001f;
+    settings->erodeRate = 0.04f;
+    settings->depositRate = 0.04f;
+    settings->evaporate = 0.10f;
+    settings->maxStep = 1.0f;
+    settings->smoothPasses = 8;
+    settings->rockThreshold = 0.42f;
+}
+
+static unsigned int TerrainRngNext(unsigned int *state) {
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+static float TerrainRng01(unsigned int *state) {
+    return (float)(TerrainRngNext(state) >> 8) * (1.0f / 16777216.0f);
+}
+
+static int TerrainHash(int x, int y, int seed) {
+    int h = x * 374761393 + y * 668265263 + seed * 362437;
+    h = (h ^ (h >> 13)) * 1274126177;
+    return h & 1023;
+}
+
+static float TerrainSmoothstep(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float TerrainGradient(int hash, float x, float y) {
+    switch (hash & 3) {
+        case 0: return x + y;
+        case 1: return -x + y;
+        case 2: return x - y;
+        default: return -x - y;
+    }
+}
+
+static float TerrainPerlin(float x, float y, int seed) {
+    int X = (int)floorf(x);
+    int Y = (int)floorf(y);
+    float xf = x - floorf(x);
+    float yf = y - floorf(y);
+
+    int h00 = TerrainHash(X, Y, seed);
+    int h10 = TerrainHash(X + 1, Y, seed);
+    int h01 = TerrainHash(X, Y + 1, seed);
+    int h11 = TerrainHash(X + 1, Y + 1, seed);
+
+    float u = TerrainSmoothstep(xf);
+    float v = TerrainSmoothstep(yf);
+
+    float n00 = TerrainGradient(h00, xf, yf);
+    float n10 = TerrainGradient(h10, xf - 1.0f, yf);
+    float n01 = TerrainGradient(h01, xf, yf - 1.0f);
+    float n11 = TerrainGradient(h11, xf - 1.0f, yf - 1.0f);
+
+    return Lerp(Lerp(n00, n10, u), Lerp(n01, n11, u), v);
+}
+
+static void NormalizeTerrainMap(float *map, int count) {
+    float minValue = FLT_MAX;
+    float maxValue = -FLT_MAX;
+    for (int i = 0; i < count; i++) {
+        if (map[i] < minValue) minValue = map[i];
+        if (map[i] > maxValue) maxValue = map[i];
+    }
+
+    float span = fmaxf(maxValue - minValue, 0.0001f);
+    for (int i = 0; i < count; i++) {
+        map[i] = Clamp((map[i] - minValue) / span, 0.0f, 1.0f);
+    }
+}
+
+static void GenerateNoiseHeightmap(float *map, const TerrainGenSettings *settings) {
+    unsigned int rng = (unsigned int)settings->seed;
+    float offsetX = TerrainRng01(&rng) * 10000.0f;
+    float offsetZ = TerrainRng01(&rng) * 10000.0f;
+    int count = TERRAIN_GEN_SIZE * TERRAIN_GEN_SIZE;
+
+    for (int z = 0; z < TERRAIN_GEN_SIZE; z++) {
+        for (int x = 0; x < TERRAIN_GEN_SIZE; x++) {
+            float noise = 0.0f;
+            float frequency = settings->frequency * settings->lacunarity;
+            float amplitude = settings->amplitude;
+            float totalAmplitude = 0.0f;
+
+            for (int octave = 0; octave < settings->octaves; octave++) {
+                float nx = ((float)x + offsetX) * frequency;
+                float nz = ((float)z + offsetZ) * frequency;
+                noise += TerrainPerlin(nx, nz, settings->seed + octave * 101) * amplitude;
+                totalAmplitude += amplitude;
+                amplitude *= settings->persistence;
+                frequency *= settings->lacunarity;
+            }
+
+            int index = TerrainGenIndex(x, z);
+            map[index] = (totalAmplitude > 0.0f) ? noise / totalAmplitude : 0.0f;
+            map[index] = (map[index] + 1.0f) * 0.5f;
+        }
+    }
+
+    NormalizeTerrainMap(map, count);
+
+    for (int i = 0; i < count; i++) {
+        map[i] = powf(Clamp(map[i], 0.0f, 1.0f), settings->heightPower);
+    }
+
+    NormalizeTerrainMap(map, count);
+}
+
+static void ApplyHydroErosionToMap(float *map, const TerrainGenSettings *settings) {
+    unsigned int rng = (unsigned int)(settings->seed * 9781 + 17);
+
+    for (int drop = 0; drop < settings->droplets; drop++) {
+        float x = TerrainRng01(&rng) * (float)(TERRAIN_GEN_SIZE - 2) + 0.5f;
+        float z = TerrainRng01(&rng) * (float)(TERRAIN_GEN_SIZE - 2) + 0.5f;
+        float dirX = 0.0f;
+        float dirZ = 0.0f;
+        float speed = 1.0f;
+        float water = 1.0f;
+        float sediment = 0.0f;
+
+        for (int life = 0; life < settings->lifetime; life++) {
+            int xi = (int)x;
+            int zi = (int)z;
+            if (xi < 0 || xi >= TERRAIN_GEN_SIZE - 1 || zi < 0 || zi >= TERRAIN_GEN_SIZE - 1) break;
+
+            float fx = x - (float)xi;
+            float fz = z - (float)zi;
+            float h00 = map[TerrainGenIndex(xi, zi)];
+            float h10 = map[TerrainGenIndex(xi + 1, zi)];
+            float h01 = map[TerrainGenIndex(xi, zi + 1)];
+            float h11 = map[TerrainGenIndex(xi + 1, zi + 1)];
+            float height = h00 * (1.0f - fx) * (1.0f - fz) +
+                           h10 * fx * (1.0f - fz) +
+                           h01 * (1.0f - fx) * fz +
+                           h11 * fx * fz;
+            float gradX = (h10 - h00) * (1.0f - fz) + (h11 - h01) * fz;
+            float gradZ = (h01 - h00) * (1.0f - fx) + (h11 - h10) * fx;
+
+            dirX = dirX * settings->inertia - gradX * (1.0f - settings->inertia);
+            dirZ = dirZ * settings->inertia - gradZ * (1.0f - settings->inertia);
+            float len = sqrtf(dirX * dirX + dirZ * dirZ);
+            if (len > 0.00001f) {
+                dirX /= len;
+                dirZ /= len;
+            } else {
+                dirX = (TerrainRng01(&rng) - 0.5f) * 2.0f;
+                dirZ = (TerrainRng01(&rng) - 0.5f) * 2.0f;
+            }
+
+            x += dirX;
+            z += dirZ;
+            if (x < 0.0f || x >= TERRAIN_GEN_SIZE - 1 || z < 0.0f || z >= TERRAIN_GEN_SIZE - 1) break;
+
+            xi = (int)x;
+            zi = (int)z;
+            fx = x - (float)xi;
+            fz = z - (float)zi;
+            float nh00 = map[TerrainGenIndex(xi, zi)];
+            float nh10 = map[TerrainGenIndex(xi + 1, zi)];
+            float nh01 = map[TerrainGenIndex(xi, zi + 1)];
+            float nh11 = map[TerrainGenIndex(xi + 1, zi + 1)];
+            float newHeight = nh00 * (1.0f - fx) * (1.0f - fz) +
+                              nh10 * fx * (1.0f - fz) +
+                              nh01 * (1.0f - fx) * fz +
+                              nh11 * fx * fz;
+            float delta = newHeight - height;
+
+            float capacity = fmaxf(-delta * speed * water * settings->capacity, settings->minSlope);
+            if (sediment > capacity || delta > 0.0f) {
+                float deposit = (delta > 0.0f) ? fminf(sediment, delta) : (sediment - capacity) * settings->depositRate;
+                deposit = fminf(deposit, settings->maxStep);
+                sediment -= deposit;
+
+                map[TerrainGenIndex(xi, zi)] = Clamp(map[TerrainGenIndex(xi, zi)] + deposit * (1.0f - fx) * (1.0f - fz), 0.0f, 1.0f);
+                map[TerrainGenIndex(xi + 1, zi)] = Clamp(map[TerrainGenIndex(xi + 1, zi)] + deposit * fx * (1.0f - fz), 0.0f, 1.0f);
+                map[TerrainGenIndex(xi, zi + 1)] = Clamp(map[TerrainGenIndex(xi, zi + 1)] + deposit * (1.0f - fx) * fz, 0.0f, 1.0f);
+                map[TerrainGenIndex(xi + 1, zi + 1)] = Clamp(map[TerrainGenIndex(xi + 1, zi + 1)] + deposit * fx * fz, 0.0f, 1.0f);
+            } else {
+                float erode = fminf((capacity - sediment) * settings->erodeRate, -delta);
+                erode = fminf(erode, settings->maxStep);
+
+                for (int ox = 0; ox <= 1; ox++) {
+                    for (int oz = 0; oz <= 1; oz++) {
+                        float weight = ((ox == 0) ? (1.0f - fx) : fx) * ((oz == 0) ? (1.0f - fz) : fz);
+                        int index = TerrainGenIndex(xi + ox, zi + oz);
+                        float deltaCell = fminf(map[index], erode * weight);
+                        map[index] = Clamp(map[index] - deltaCell, 0.0f, 1.0f);
+                        sediment += deltaCell;
+                    }
+                }
+            }
+
+            speed = sqrtf(fmaxf(speed * speed + fabsf(delta) * 0.1f, 0.0f));
+            water *= (1.0f - settings->evaporate);
+            if (water < 0.01f) break;
+        }
+    }
+}
+
+static void SmoothTerrainMap(float *map, int passes) {
+    int count = TERRAIN_GEN_SIZE * TERRAIN_GEN_SIZE;
+    float *scratch = (float *)malloc((size_t)count * sizeof(float));
+    if (scratch == NULL) return;
+
+    for (int pass = 0; pass < passes; pass++) {
+        memcpy(scratch, map, (size_t)count * sizeof(float));
+        for (int z = 1; z < TERRAIN_GEN_SIZE - 1; z++) {
+            for (int x = 1; x < TERRAIN_GEN_SIZE - 1; x++) {
+                float sum = 0.0f;
+                for (int dz = -1; dz <= 1; dz++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        sum += scratch[TerrainGenIndex(x + dx, z + dz)];
+                    }
+                }
+                map[TerrainGenIndex(x, z)] = sum / 9.0f;
+            }
+        }
+    }
+
+    free(scratch);
+}
+
+static void FillTerrainPits(float *map) {
+    const float epsilon = 1e-5f;
+    for (int pass = 0; pass < 3; pass++) {
+        for (int z = 1; z < TERRAIN_GEN_SIZE - 1; z++) {
+            for (int x = 1; x < TERRAIN_GEN_SIZE - 1; x++) {
+                float h = map[TerrainGenIndex(x, z)];
+                float localMin = h;
+                for (int dz = -1; dz <= 1; dz++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        float neighbor = map[TerrainGenIndex(x + dx, z + dz)];
+                        if (neighbor < localMin) localMin = neighbor;
+                    }
+                }
+                if (h < localMin - epsilon) {
+                    map[TerrainGenIndex(x, z)] = localMin;
+                }
+            }
+        }
+    }
+}
+
+static bool GenerateProceduralTerrain(TerrainGrid *terrain, const TerrainGenSettings *settings) {
+    int count = TERRAIN_GEN_SIZE * TERRAIN_GEN_SIZE;
+    float *map = (float *)malloc((size_t)count * sizeof(float));
+    terrain->width = TERRAIN_GEN_SIZE;
+    terrain->height = TERRAIN_GEN_SIZE;
+    terrain->terrainY = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainMeters = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainDx = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainDz = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainSlope = (float *)calloc((size_t)count, sizeof(float));
+
+    if (map == NULL || !terrain->terrainY || !terrain->terrainMeters || !terrain->terrainDx ||
+        !terrain->terrainDz || !terrain->terrainSlope) {
+        free(map);
+        FreeTerrain(terrain);
+        return false;
+    }
+
+    GenerateNoiseHeightmap(map, settings);
+    ApplyHydroErosionToMap(map, settings);
+    SmoothTerrainMap(map, settings->smoothPasses);
+    FillTerrainPits(map);
+    NormalizeTerrainMap(map, count);
+
+    terrain->minTerrainY = FLT_MAX;
+    terrain->maxTerrainY = -FLT_MAX;
+    terrain->minTerrainMeters = FLT_MAX;
+    terrain->maxTerrainMeters = -FLT_MAX;
+
+    for (int z = 0; z < TERRAIN_GEN_SIZE; z++) {
+        for (int x = 0; x < TERRAIN_GEN_SIZE; x++) {
+            int index = TerrainGenIndex(x, z);
+            float worldHeight = map[index] * TERRAIN_GEN_HEIGHT_WORLD;
+            terrain->terrainY[index] = worldHeight;
+            terrain->terrainMeters[index] = worldHeight * OBJ_VERTICAL_METERS;
+
+            if (terrain->terrainY[index] < terrain->minTerrainY) terrain->minTerrainY = terrain->terrainY[index];
+            if (terrain->terrainY[index] > terrain->maxTerrainY) terrain->maxTerrainY = terrain->terrainY[index];
+            if (terrain->terrainMeters[index] < terrain->minTerrainMeters) terrain->minTerrainMeters = terrain->terrainMeters[index];
+            if (terrain->terrainMeters[index] > terrain->maxTerrainMeters) terrain->maxTerrainMeters = terrain->terrainMeters[index];
+        }
+    }
+
+    free(map);
+    ComputeTerrainDerivatives(terrain);
+    return true;
+}
+
 static bool LoadOBJHeightField(const char *path, TerrainGrid *terrain) {
     FILE *file = fopen(path, "r");
     if (!file) return false;
@@ -715,7 +1129,7 @@ static bool LoadOBJHeightField(const char *path, TerrainGrid *terrain) {
     return true;
 }
 
-static Color TerrainColor(float heightNorm, float slope, float shade) {
+static Color TerrainColor(float heightNorm, float slope, float shade, float rockThreshold) {
     Color lowGrass = (Color) { 58, 93, 54, 255 };
     Color alpine = (Color) { 122, 130, 82, 255 };
     Color warmRock = (Color) { 133, 118, 103, 255 };
@@ -724,7 +1138,7 @@ static Color TerrainColor(float heightNorm, float slope, float shade) {
     Color base;
 
     if (heightNorm > 0.86f) base = LerpColor(coldRock, snow, NormalizeRange(heightNorm, 0.86f, 1.0f));
-    else if (slope > 0.58f) base = LerpColor(warmRock, coldRock, NormalizeRange(slope, 0.58f, 1.0f));
+    else if (slope > rockThreshold) base = LerpColor(warmRock, coldRock, NormalizeRange(slope, rockThreshold, 1.0f));
     else if (heightNorm > 0.52f) base = LerpColor(alpine, warmRock, NormalizeRange(heightNorm, 0.52f, 0.86f));
     else base = LerpColor(lowGrass, alpine, NormalizeRange(heightNorm, 0.18f, 0.52f));
 
@@ -735,7 +1149,7 @@ static Color TerrainColor(float heightNorm, float slope, float shade) {
     return base;
 }
 
-static Model BuildTerrainModel(const TerrainGrid *terrain) {
+static Model BuildTerrainModel(const TerrainGrid *terrain, const TerrainGenSettings *settings) {
     const int vertexCount = terrain->width * terrain->height;
     const int indexCount = (terrain->width - 1) * (terrain->height - 1) * 6;
     Vector3 *vertices = (Vector3 *)MemAlloc((size_t)vertexCount * sizeof(Vector3));
@@ -789,7 +1203,8 @@ static Model BuildTerrainModel(const TerrainGrid *terrain) {
         float slope = 1.0f - Clamp(Vector3DotProduct(normals[i], (Vector3) { 0.0f, 1.0f, 0.0f }), 0.0f, 1.0f);
         float shade = Clamp(Vector3DotProduct(normals[i], lightDir), 0.0f, 1.0f);
         float hNorm = NormalizeRange(vertices[i].y, terrain->minTerrainY, terrain->maxTerrainY);
-        colors[i] = TerrainColor(hNorm, slope, shade);
+        float rockThreshold = (settings != NULL) ? settings->rockThreshold : 0.58f;
+        colors[i] = TerrainColor(hNorm, slope, shade, rockThreshold);
     }
 
     Mesh mesh = { 0 };
@@ -1122,12 +1537,65 @@ static void BuildAtmosColumns(AtmosphereSim *sim) {
     }
 }
 
+static SimViewSettings CaptureSimViewSettings(const AtmosphereSim *sim) {
+    SimViewSettings settings = {
+        .fieldMode = sim->fieldMode,
+        .verticalAxis = sim->verticalAxis,
+        .horizontalLayer = sim->horizontalLayer,
+        .verticalSlice = sim->verticalSlice,
+        .showHorizontalSlice = sim->showHorizontalSlice,
+        .showVerticalSlice = sim->showVerticalSlice,
+        .showTerrain = sim->showTerrain,
+        .showWireframe = sim->showWireframe,
+        .showWindArrows = sim->showWindArrows,
+        .showClouds = sim->showClouds,
+        .showVolume = sim->showVolume,
+        .paused = sim->paused,
+        .showUI = sim->showUI,
+        .terrainAlpha = sim->terrainAlpha,
+        .cloudRenderAlpha = sim->cloudRenderAlpha,
+        .cloudRenderThreshold = sim->cloudRenderThreshold,
+        .cloudDensityScale = sim->cloudDensityScale,
+        .timeScale = sim->timeScale,
+        .volumeThreshold = sim->volumeThreshold,
+        .volumeAlpha = sim->volumeAlpha,
+        .volumeStride = sim->volumeStride,
+        .activeControlTab = sim->activeControlTab
+    };
+    return settings;
+}
+
+static void RestoreSimViewSettings(AtmosphereSim *sim, const SimViewSettings *settings) {
+    sim->fieldMode = settings->fieldMode;
+    sim->verticalAxis = settings->verticalAxis;
+    sim->horizontalLayer = Clamp(settings->horizontalLayer, 0, sim->ny - 1);
+    sim->verticalSlice = Clamp(settings->verticalSlice, 0, (settings->verticalAxis == SLICE_X) ? sim->nx - 1 : sim->nz - 1);
+    sim->showHorizontalSlice = settings->showHorizontalSlice;
+    sim->showVerticalSlice = settings->showVerticalSlice;
+    sim->showTerrain = settings->showTerrain;
+    sim->showWireframe = settings->showWireframe;
+    sim->showWindArrows = settings->showWindArrows;
+    sim->showClouds = settings->showClouds;
+    sim->showVolume = settings->showVolume;
+    sim->paused = settings->paused;
+    sim->showUI = settings->showUI;
+    sim->terrainAlpha = settings->terrainAlpha;
+    sim->cloudRenderAlpha = settings->cloudRenderAlpha;
+    sim->cloudRenderThreshold = settings->cloudRenderThreshold;
+    sim->cloudDensityScale = settings->cloudDensityScale;
+    sim->timeScale = settings->timeScale;
+    sim->volumeThreshold = settings->volumeThreshold;
+    sim->volumeAlpha = settings->volumeAlpha;
+    sim->volumeStride = settings->volumeStride;
+    sim->activeControlTab = settings->activeControlTab;
+}
+
 static void ResetAtmosphere(AtmosphereSim *sim) {
     sim->simSeconds = 11.0f * 3600.0f;
     sim->timeScale = DEFAULT_TIME_SCALE;
     sim->prevailingU = 7.5f;
     sim->prevailingV = 2.5f;
-    sim->terrainAlpha = 0.72f;
+    sim->terrainAlpha = 1.0f;
     sim->fieldMode = FIELD_TEMPERATURE;
     sim->verticalAxis = SLICE_Z;
     sim->horizontalLayer = sim->ny / 2;
@@ -1209,6 +1677,11 @@ static void UpdateStats(AtmosphereSim *sim) {
     float maxRain = 0.0f;
     float maxWind = 0.0f;
 
+    for (int mode = 0; mode < FIELD_COUNT; mode++) {
+        sim->fieldDisplayMin[mode] = FLT_MAX;
+        sim->fieldDisplayMax[mode] = -FLT_MAX;
+    }
+
     for (int z = 0; z < sim->nz; z++) {
         for (int x = 0; x < sim->nx; x++) {
             int column = ColumnIndex(sim, x, z);
@@ -1230,8 +1703,61 @@ static void UpdateStats(AtmosphereSim *sim) {
         }
     }
 
-    for (int i = 0; i < sim->cells3D; i++) {
-        if (sim->cloud[i] > maxCloud) maxCloud = sim->cloud[i];
+    for (int z = 0; z < sim->nz; z++) {
+        for (int y = 0; y < sim->ny; y++) {
+            for (int x = 0; x < sim->nx; x++) {
+                if (!IsFluidCell(sim, x, y, z)) continue;
+
+                for (int mode = 0; mode < FIELD_COUNT; mode++) {
+                    float value = FieldDisplayValue(sim, x, y, z, (FieldMode)mode);
+                    if (value < sim->fieldDisplayMin[mode]) sim->fieldDisplayMin[mode] = value;
+                    if (value > sim->fieldDisplayMax[mode]) sim->fieldDisplayMax[mode] = value;
+                }
+
+                int i = AtmosIndex(sim, x, y, z);
+                if (sim->cloud[i] > maxCloud) maxCloud = sim->cloud[i];
+            }
+        }
+    }
+
+    for (int mode = 0; mode < FIELD_COUNT; mode++) {
+        float minValue = sim->fieldDisplayMin[mode];
+        float maxValue = sim->fieldDisplayMax[mode];
+
+        if (minValue == FLT_MAX || maxValue == -FLT_MAX || !isfinite(minValue) || !isfinite(maxValue)) {
+            FieldRange((FieldMode)mode, &sim->fieldDisplayMin[mode], &sim->fieldDisplayMax[mode]);
+            continue;
+        }
+
+        if (mode == FIELD_VERTICAL_WIND || mode == FIELD_BUOYANCY) {
+            float maxAbs = fmaxf(fabsf(minValue), fabsf(maxValue));
+            float pad = fmaxf(maxAbs * 0.08f, 0.02f);
+            sim->fieldDisplayMin[mode] = -(maxAbs + pad);
+            sim->fieldDisplayMax[mode] = maxAbs + pad;
+            continue;
+        }
+
+        float span = maxValue - minValue;
+        if (span < 0.0001f) {
+            float center = 0.5f * (minValue + maxValue);
+            span = fmaxf(fabsf(center) * 0.15f, 0.1f);
+            minValue = center - span;
+            maxValue = center + span;
+        } else {
+            float pad = span * 0.08f;
+            minValue -= pad;
+            maxValue += pad;
+        }
+
+        if (mode == FIELD_WIND || mode == FIELD_CLOUD || mode == FIELD_RAIN || mode == FIELD_VAPOR) {
+            minValue = fmaxf(0.0f, minValue);
+        } else if (mode == FIELD_REL_HUMIDITY) {
+            minValue = fmaxf(0.0f, minValue);
+            maxValue = fminf(130.0f, maxValue);
+        }
+
+        sim->fieldDisplayMin[mode] = minValue;
+        sim->fieldDisplayMax[mode] = maxValue;
     }
 
     sim->meanSurfaceTemp = (float)(tempSum / (double)sim->cells2D);
@@ -1687,6 +2213,19 @@ static void FieldRange(FieldMode mode, float *outMin, float *outMax) {
     }
 }
 
+static void FieldDisplayRange(const AtmosphereSim *sim, FieldMode mode, float *outMin, float *outMax) {
+    float minValue = sim->fieldDisplayMin[mode];
+    float maxValue = sim->fieldDisplayMax[mode];
+
+    if (!isfinite(minValue) || !isfinite(maxValue) || minValue >= maxValue) {
+        FieldRange(mode, outMin, outMax);
+        return;
+    }
+
+    *outMin = minValue;
+    *outMax = maxValue;
+}
+
 static float FieldDisplayValue(const AtmosphereSim *sim, int x, int y, int z, FieldMode mode) {
     int i = AtmosIndex(sim, x, y, z);
     switch (mode) {
@@ -1730,47 +2269,35 @@ static float FieldDisplaySample(const AtmosphereSim *sim, float x, float y, floa
     }
 }
 
-static Color FieldColorFromValue(FieldMode mode, float displayValue, float directionU, float directionV) {
+static Color FieldColorFromValue(const AtmosphereSim *sim, FieldMode mode, float displayValue, float directionU, float directionV) {
+    (void)directionU;
+    (void)directionV;
     float minValue = 0.0f;
     float maxValue = 1.0f;
-    FieldRange(mode, &minValue, &maxValue);
+    FieldDisplayRange(sim, mode, &minValue, &maxValue);
     float t = NormalizeRange(displayValue, minValue, maxValue);
 
     switch (mode) {
         case FIELD_TEMPERATURE:
-            return LerpColor(LerpColor((Color) { 25, 47, 120, 255 }, (Color) { 68, 156, 212, 255 }, t),
-                             LerpColor((Color) { 243, 216, 116, 255 }, (Color) { 194, 68, 48, 255 }, t),
-                             t);
+            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
         case FIELD_PRESSURE:
-            return LerpColor(LerpColor((Color) { 35, 73, 166, 255 }, (Color) { 112, 184, 228, 255 }, t),
-                             LerpColor((Color) { 238, 232, 210, 255 }, (Color) { 184, 92, 45, 255 }, t),
-                             t);
+            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
         case FIELD_REL_HUMIDITY:
-            return LerpColor(LerpColor((Color) { 135, 90, 42, 255 }, (Color) { 162, 146, 92, 255 }, t),
-                             LerpColor((Color) { 71, 170, 193, 255 }, (Color) { 216, 241, 255, 255 }, t),
-                             t);
+            return RampColor(t, kHumidityStops, (int)(sizeof(kHumidityStops) / sizeof(kHumidityStops[0])));
         case FIELD_DEWPOINT:
-            return LerpColor(LerpColor((Color) { 31, 60, 128, 255 }, (Color) { 70, 180, 220, 255 }, t),
-                             LerpColor((Color) { 148, 202, 112, 255 }, (Color) { 215, 160, 71, 255 }, t),
-                             t);
+            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
         case FIELD_VAPOR:
-            return LerpColor((Color) { 140, 94, 47, 255 }, (Color) { 52, 122, 214, 255 }, t);
+            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
         case FIELD_CLOUD:
-            return LerpColor((Color) { 35, 48, 72, 255 }, (Color) { 245, 248, 252, 255 }, t);
+            return RampColor(t, kCloudStops, (int)(sizeof(kCloudStops) / sizeof(kCloudStops[0])));
         case FIELD_RAIN:
-            return LerpColor((Color) { 24, 30, 50, 255 }, (Color) { 92, 200, 255, 255 }, t);
-        case FIELD_WIND: {
-            float angle = atan2f(directionV, directionU) * RAD2DEG + 180.0f;
-            return HSVToColor(angle, 0.80f, 0.25f + 0.75f * t);
-        }
+            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
+        case FIELD_WIND:
+            return RampColor(t, kSpectralStops, (int)(sizeof(kSpectralStops) / sizeof(kSpectralStops[0])));
         case FIELD_VERTICAL_WIND:
-            return LerpColor(LerpColor((Color) { 173, 75, 36, 255 }, (Color) { 230, 190, 102, 255 }, t),
-                             LerpColor((Color) { 76, 182, 220, 255 }, (Color) { 42, 92, 212, 255 }, t),
-                             t);
+            return RampColor(t, kDivergingStops, (int)(sizeof(kDivergingStops) / sizeof(kDivergingStops[0])));
         case FIELD_BUOYANCY:
-            return LerpColor(LerpColor((Color) { 172, 72, 34, 255 }, (Color) { 233, 196, 104, 255 }, t),
-                             LerpColor((Color) { 79, 189, 226, 255 }, (Color) { 37, 88, 214, 255 }, t),
-                             t);
+            return RampColor(t, kDivergingStops, (int)(sizeof(kDivergingStops) / sizeof(kDivergingStops[0])));
         default:
             return WHITE;
     }
@@ -1806,7 +2333,7 @@ static void UpdateHorizontalSliceTexture(AtmosphereSim *sim) {
     int texHeight = sim->nz * SLICE_TEX_SCALE;
 
     for (int z = 0; z < texHeight; z++) {
-        float sampleZ = (texHeight > 1) ? ((float)(texHeight - 1 - z) / (float)(texHeight - 1)) * (float)(sim->nz - 1) : 0.0f;
+        float sampleZ = (texHeight > 1) ? ((float)z / (float)(texHeight - 1)) * (float)(sim->nz - 1) : 0.0f;
         int cellZ = Clamp((int)lroundf(sampleZ), 0, sim->nz - 1);
 
         for (int x = 0; x < texWidth; x++) {
@@ -1822,7 +2349,7 @@ static void UpdateHorizontalSliceTexture(AtmosphereSim *sim) {
             float value = FieldDisplaySample(sim, sampleX, (float)layer, sampleZ, sim->fieldMode);
             float dirU = SampleAtmosField(sim, sim->u, sampleX, (float)layer, sampleZ);
             float dirV = SampleAtmosField(sim, sim->v, sampleX, (float)layer, sampleZ);
-            Color color = FieldColorFromValue(sim->fieldMode, value, dirU, dirV);
+            Color color = FieldColorFromValue(sim, sim->fieldMode, value, dirU, dirV);
             unsigned char alpha = (sim->fieldMode == FIELD_CLOUD || sim->fieldMode == FIELD_RAIN) ? 216 : 236;
             sim->horizontalPixels[dst] = WithAlpha(color, alpha);
         }
@@ -1863,8 +2390,10 @@ static void UpdateVerticalSliceTexture(AtmosphereSim *sim) {
             float value = FieldDisplaySample(sim, sampleX, sampleY, sampleZ, sim->fieldMode);
             float dirU = SampleAtmosField(sim, sim->u, sampleX, sampleY, sampleZ);
             float dirV = SampleAtmosField(sim, sim->v, sampleX, sampleY, sampleZ);
-            Color color = FieldColorFromValue(sim->fieldMode, value, dirU, dirV);
+            Color color = FieldColorFromValue(sim, sim->fieldMode, value, dirU, dirV);
+            float topFade = Clamp(((float)(sim->ny - 1) - sampleY) / 0.9f, 0.0f, 1.0f);
             unsigned char alpha = (sim->fieldMode == FIELD_CLOUD || sim->fieldMode == FIELD_RAIN) ? 220 : 240;
+            alpha = (unsigned char)((float)alpha * (0.18f + 0.82f * topFade));
             sim->verticalPixels[dst] = WithAlpha(color, alpha);
         }
     }
@@ -1936,10 +2465,10 @@ static ImU32 ImGuiColorU32(Color color, float alphaScale) {
     return igColorConvertFloat4ToU32(col);
 }
 
-static void DrawFieldLegendHud(FieldMode mode) {
+static void DrawFieldLegendHud(const AtmosphereSim *sim, FieldMode mode) {
     float minValue = 0.0f;
     float maxValue = 1.0f;
-    FieldRange(mode, &minValue, &maxValue);
+    FieldDisplayRange(sim, mode, &minValue, &maxValue);
 
     ImVec2_c avail = igGetContentRegionAvail();
     float legendWidth = fminf(fmaxf(avail.x - 8.0f, 160.0f), 320.0f);
@@ -1956,8 +2485,8 @@ static void DrawFieldLegendHud(FieldMode mode) {
         float t1 = (float)(segment + 1) / (float)segments;
         float value0 = Lerp(minValue, maxValue, t0);
         float value1 = Lerp(minValue, maxValue, t1);
-        Color color0 = FieldColorFromValue(mode, value0, 1.0f, 0.0f);
-        Color color1 = FieldColorFromValue(mode, value1, 1.0f, 0.0f);
+        Color color0 = FieldColorFromValue(sim, mode, value0, 1.0f, 0.0f);
+        Color color1 = FieldColorFromValue(sim, mode, value1, 1.0f, 0.0f);
         ImVec2_c p0 = ImVec2Make(pos.x + legendWidth * t0, pos.y);
         ImVec2_c p1 = ImVec2Make(pos.x + legendWidth * t1, pos.y + legendHeight);
         ImU32 c0 = ImGuiColorU32(color0, 1.0f);
@@ -2010,7 +2539,7 @@ static void DrawWindArrowsOnHorizontalSlice(const AtmosphereSim *sim) {
                 start.y + sim->w[i] * 0.16f,
                 start.z + sim->v[i] * 0.24f
             };
-            Color color = WithAlpha(FieldColorFromValue(FIELD_WIND, speed, sim->u[i], sim->v[i]), 220);
+            Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, sim->u[i], sim->v[i]), 220);
             DrawLine3D(start, tip, color);
         }
     }
@@ -2029,7 +2558,7 @@ static void DrawWindArrowsOnVerticalSlice(const AtmosphereSim *sim) {
                 if (speed < 0.8f) continue;
                 Vector3 start = { xWorld, WorldYFromMeters(CellAltitudeMeters(sim, y)), (float)z * sim->dzWorld };
                 Vector3 tip = { start.x, start.y + sim->w[i] * 0.20f, start.z + sim->v[i] * 0.22f };
-                Color color = WithAlpha(FieldColorFromValue(FIELD_WIND, speed, 0.0f, sim->v[i]), 220);
+                Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, 0.0f, sim->v[i]), 220);
                 DrawLine3D(start, tip, color);
             }
         }
@@ -2043,7 +2572,7 @@ static void DrawWindArrowsOnVerticalSlice(const AtmosphereSim *sim) {
                 if (speed < 0.8f) continue;
                 Vector3 start = { (float)x * sim->dxWorld, WorldYFromMeters(CellAltitudeMeters(sim, y)), zWorld };
                 Vector3 tip = { start.x + sim->u[i] * 0.22f, start.y + sim->w[i] * 0.20f, start.z };
-                Color color = WithAlpha(FieldColorFromValue(FIELD_WIND, speed, sim->u[i], 0.0f), 220);
+                Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, sim->u[i], 0.0f), 220);
                 DrawLine3D(start, tip, color);
             }
         }
@@ -2113,7 +2642,7 @@ static void DrawVolumeField3D(const AtmosphereSim *sim) {
                         start.z + sim->v[i] * 0.22f
                     };
                     unsigned char alpha = (unsigned char)(255.0f * Clamp(sim->volumeAlpha * weight, 0.12f, 0.90f));
-                    Color color = WithAlpha(FieldColorFromValue(FIELD_WIND, speed, sim->u[i], sim->v[i]), alpha);
+                    Color color = WithAlpha(FieldColorFromValue(sim, FIELD_WIND, speed, sim->u[i], sim->v[i]), alpha);
                     DrawLine3D(start, tip, color);
                     DrawSphereEx(tip, 0.28f + 0.18f * weight, 4, 4, color);
                 }
@@ -2138,7 +2667,7 @@ static void DrawVolumeField3D(const AtmosphereSim *sim) {
                 if (weight < sim->volumeThreshold) continue;
 
                 unsigned char alpha = (unsigned char)(255.0f * Clamp(sim->volumeAlpha * weight, 0.08f, 0.88f));
-                Color color = WithAlpha(FieldColorFromValue(sim->fieldMode, value, sim->u[i], sim->v[i]), alpha);
+                Color color = WithAlpha(FieldColorFromValue(sim, sim->fieldMode, value, sim->u[i], sim->v[i]), alpha);
                 Vector3 position = {
                     (float)x * sim->dxWorld,
                     WorldYFromMeters(CellAltitudeMeters(sim, y)),
@@ -2190,7 +2719,7 @@ static void DrawImGuiHud(const AtmosphereSim *sim) {
     int minute = ((int)(sim->simSeconds / 60.0f)) % 60;
     float fieldMin = 0.0f;
     float fieldMax = 1.0f;
-    FieldRange(sim->fieldMode, &fieldMin, &fieldMax);
+    FieldDisplayRange(sim, sim->fieldMode, &fieldMin, &fieldMax);
 
     igSetNextWindowPos(ImVec2Make(14.0f, 14.0f), ImGuiCond_Always, ImVec2Make(0.0f, 0.0f));
     igSetNextWindowBgAlpha(0.78f);
@@ -2217,12 +2746,14 @@ static void DrawImGuiHud(const AtmosphereSim *sim) {
         ImGuiIO *io = igGetIO_Nil();
         if (io != NULL) igText("FPS %.0f", io->Framerate);
         igSeparator();
-        DrawFieldLegendHud(sim->fieldMode);
+        DrawFieldLegendHud(sim, sim->fieldMode);
     }
     igEnd();
 }
 
-static void DrawImGuiControls(AtmosphereSim *sim) {
+static bool DrawImGuiControls(AtmosphereSim *sim) {
+    bool terrainChanged = false;
+
     if (!sim->showUI) {
         Rectangle toggleRect = GetUiToggleRect();
         igSetNextWindowPos(ImVec2Make(toggleRect.x, toggleRect.y), ImGuiCond_Always, ImVec2Make(0.0f, 0.0f));
@@ -2238,7 +2769,7 @@ static void DrawImGuiControls(AtmosphereSim *sim) {
             if (igButton("Show Controls", ImVec2Make(toggleRect.width - 18.0f, 0.0f))) sim->showUI = true;
         }
         igEnd();
-        return;
+        return false;
     }
 
     Rectangle panel = GetControlPanelRect();
@@ -2262,111 +2793,184 @@ static void DrawImGuiControls(AtmosphereSim *sim) {
         if (igBeginChild_Str("##AtmosphereScroll", ImVec2Make(0.0f, 0.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_None)) {
             igPushItemWidth(-FLT_MIN);
 
-            igSeparatorText("Display");
-            int fieldMode = (int)sim->fieldMode;
-            if (DrawLabeledCombo("Field", "##FieldMode", &fieldMode, kFieldLabels, FIELD_COUNT)) {
-                sim->fieldMode = (FieldMode)fieldMode;
+            if (igBeginTabBar("##ControlTabs", ImGuiTabBarFlags_None)) {
+                if (igBeginTabItem("Weather", NULL, ImGuiTabItemFlags_None)) {
+                    igSeparatorText("Display");
+                    int fieldMode = (int)sim->fieldMode;
+                    if (DrawLabeledCombo("Field", "##FieldMode", &fieldMode, kFieldLabels, FIELD_COUNT)) {
+                        sim->fieldMode = (FieldMode)fieldMode;
+                    }
+                    igCheckbox("Show terrain", &sim->showTerrain);
+                    igCheckbox("Wireframe terrain", &sim->showWireframe);
+                    igCheckbox("Show wind vectors", &sim->showWindArrows);
+                    igBeginDisabled(!sim->showTerrain);
+                    DrawLabeledSliderFloat("Terrain opacity", "##TerrainOpacity", &sim->terrainAlpha, 0.05f, 1.0f, "%.2f");
+                    igEndDisabled();
+
+                    igSeparatorText("Slices");
+                    igCheckbox("Horizontal slice", &sim->showHorizontalSlice);
+                    igBeginDisabled(!sim->showHorizontalSlice);
+                    DrawLabeledSliderInt("Horizontal layer", "##HorizontalLayer", &sim->horizontalLayer, 0, sim->ny - 1, "%d");
+                    igEndDisabled();
+
+                    igCheckbox("Vertical slice", &sim->showVerticalSlice);
+                    igBeginDisabled(!sim->showVerticalSlice);
+                    int axis = (int)sim->verticalAxis;
+                    if (DrawLabeledCombo("Vertical axis", "##VerticalAxis", &axis, kSliceAxisLabels, 2)) {
+                        sim->verticalAxis = (SliceAxis)axis;
+                    }
+                    int sliceMax = (sim->verticalAxis == SLICE_X) ? sim->nx - 1 : sim->nz - 1;
+                    sim->verticalSlice = Clamp(sim->verticalSlice, 0, sliceMax);
+                    DrawLabeledSliderInt("Slice index", "##SliceIndex", &sim->verticalSlice, 0, sliceMax, "%d");
+                    igEndDisabled();
+
+                    igSeparatorText("Simulation");
+                    DrawLabeledSliderFloat("Time scale", "##TimeScale", &sim->timeScale, 30.0f, 1200.0f, "%.0fx");
+                    igTextDisabled("Current units");
+                    igText("%s", FieldUnits(sim->fieldMode));
+                    igTextDisabled("Statistics");
+                    igText("Surface temp  %.1f C", sim->meanSurfaceTemp);
+                    igText("Pressure      %.1f hPa", sim->meanPressure);
+                    igText("Peak wind     %.1f m/s", sim->maxWind);
+                    igText("Peak rain     %.1f mm/h", sim->maxRain);
+                    igText("Peak cloud    %.2f g/kg", sim->maxCloud * 1000.0f);
+
+                    igSeparatorText("Controls");
+                    igPushTextWrapPos(0.0f);
+                    igTextWrapped("The panel captures the mouse while you hover or drag inside it, so camera orbit and zoom stay locked out during UI interaction.");
+                    igPopTextWrapPos();
+                    igBulletText("Left mouse drag: orbit");
+                    igBulletText("Mouse wheel: zoom");
+                    igBulletText("Space: pause");
+                    igBulletText("R: reset weather");
+                    igBulletText("Tab: cycle field");
+                    igBulletText("H / J: toggle slices");
+                    igBulletText("T: toggle terrain");
+                    igBulletText("G: hide or show panel");
+                    igEndTabItem();
+                }
+
+                if (igBeginTabItem("Terrain", NULL, ImGuiTabItemFlags_None)) {
+                    igTextDisabled("Generation");
+                    DrawLabeledSliderInt("Seed", "##TerrainSeed", &sim->terrainGen.seed, 1, 999999, "%d");
+                    if (igButton("Randomize Seed", ImVec2Make(140.0f, 0.0f))) {
+                        sim->terrainGen.seed = GetRandomValue(1, 999999);
+                    }
+                    igSameLine(0.0f, 8.0f);
+                    if (igButton("Generate Terrain", ImVec2Make(150.0f, 0.0f))) {
+                        terrainChanged = RebuildGeneratedTerrain(sim);
+                    }
+
+                    igSeparatorText("Noise");
+                    DrawLabeledSliderFloat("Base frequency", "##TerrainFreq", &sim->terrainGen.frequency, 0.0010f, 0.0200f, "%.4f");
+                    DrawLabeledSliderFloat("Amplitude", "##TerrainAmp", &sim->terrainGen.amplitude, 0.4f, 2.2f, "%.2f");
+                    DrawLabeledSliderFloat("Height bias", "##TerrainPower", &sim->terrainGen.heightPower, 0.8f, 2.8f, "%.2f");
+                    DrawLabeledSliderInt("Octaves", "##TerrainOctaves", &sim->terrainGen.octaves, 1, 6, "%d");
+                    DrawLabeledSliderFloat("Lacunarity", "##TerrainLacunarity", &sim->terrainGen.lacunarity, 1.4f, 2.4f, "%.2f");
+                    DrawLabeledSliderFloat("Persistence", "##TerrainPersistence", &sim->terrainGen.persistence, 0.35f, 0.72f, "%.2f");
+
+                    igSeparatorText("Erosion");
+                    DrawLabeledSliderInt("Droplets", "##TerrainDroplets", &sim->terrainGen.droplets, 10000, 1200000, "%d");
+                    DrawLabeledSliderInt("Lifetime", "##TerrainLifetime", &sim->terrainGen.lifetime, 4, 48, "%d");
+                    DrawLabeledSliderFloat("Inertia", "##TerrainInertia", &sim->terrainGen.inertia, 0.0f, 0.30f, "%.3f");
+                    DrawLabeledSliderFloat("Capacity", "##TerrainCapacity", &sim->terrainGen.capacity, 0.5f, 6.0f, "%.2f");
+                    DrawLabeledSliderFloat("Min slope", "##TerrainMinSlope", &sim->terrainGen.minSlope, 0.0001f, 0.0200f, "%.4f");
+                    DrawLabeledSliderFloat("Erode rate", "##TerrainErode", &sim->terrainGen.erodeRate, 0.005f, 0.120f, "%.3f");
+                    DrawLabeledSliderFloat("Deposit rate", "##TerrainDeposit", &sim->terrainGen.depositRate, 0.005f, 0.120f, "%.3f");
+                    DrawLabeledSliderFloat("Evaporation", "##TerrainEvaporate", &sim->terrainGen.evaporate, 0.02f, 0.25f, "%.2f");
+                    DrawLabeledSliderFloat("Max step", "##TerrainMaxStep", &sim->terrainGen.maxStep, 0.10f, 1.50f, "%.2f");
+                    DrawLabeledSliderInt("Smooth passes", "##TerrainSmooth", &sim->terrainGen.smoothPasses, 0, 12, "%d");
+
+                    igSeparatorText("Look");
+                    DrawLabeledSliderFloat("Rock threshold", "##TerrainRockThreshold", &sim->terrainGen.rockThreshold, 0.20f, 0.75f, "%.2f");
+
+                    igPushTextWrapPos(0.0f);
+                    igTextWrapped("Generate Terrain rebuilds the mountain mesh from the current settings and resets the weather simulation over the new terrain.");
+                    igPopTextWrapPos();
+                    igEndTabItem();
+                }
+
+                igEndTabBar();
             }
-            igCheckbox("Show terrain", &sim->showTerrain);
-            igCheckbox("Wireframe terrain", &sim->showWireframe);
-            igCheckbox("Show wind vectors", &sim->showWindArrows);
-            igBeginDisabled(!sim->showTerrain);
-            DrawLabeledSliderFloat("Terrain opacity", "##TerrainOpacity", &sim->terrainAlpha, 0.05f, 1.0f, "%.2f");
-            igEndDisabled();
-
-            igSeparatorText("Slices");
-            igCheckbox("Horizontal slice", &sim->showHorizontalSlice);
-            igBeginDisabled(!sim->showHorizontalSlice);
-            DrawLabeledSliderInt("Horizontal layer", "##HorizontalLayer", &sim->horizontalLayer, 0, sim->ny - 1, "%d");
-            igEndDisabled();
-
-            igCheckbox("Vertical slice", &sim->showVerticalSlice);
-            igBeginDisabled(!sim->showVerticalSlice);
-            int axis = (int)sim->verticalAxis;
-            if (DrawLabeledCombo("Vertical axis", "##VerticalAxis", &axis, kSliceAxisLabels, 2)) {
-                sim->verticalAxis = (SliceAxis)axis;
-            }
-            int sliceMax = (sim->verticalAxis == SLICE_X) ? sim->nx - 1 : sim->nz - 1;
-            sim->verticalSlice = Clamp(sim->verticalSlice, 0, sliceMax);
-            DrawLabeledSliderInt("Slice index", "##SliceIndex", &sim->verticalSlice, 0, sliceMax, "%d");
-            igEndDisabled();
-
-            igSeparatorText("Simulation");
-            DrawLabeledSliderFloat("Time scale", "##TimeScale", &sim->timeScale, 30.0f, 1200.0f, "%.0fx");
-            igTextDisabled("Current units");
-            igText("%s", FieldUnits(sim->fieldMode));
-            igTextDisabled("Statistics");
-            igText("Surface temp  %.1f C", sim->meanSurfaceTemp);
-            igText("Pressure      %.1f hPa", sim->meanPressure);
-            igText("Peak wind     %.1f m/s", sim->maxWind);
-            igText("Peak rain     %.1f mm/h", sim->maxRain);
-            igText("Peak cloud    %.2f g/kg", sim->maxCloud * 1000.0f);
-
-            igSeparatorText("Controls");
-            igPushTextWrapPos(0.0f);
-            igTextWrapped("The panel captures the mouse while you hover or drag inside it, so camera orbit and zoom stay locked out during UI interaction.");
-            igPopTextWrapPos();
-            igBulletText("Left mouse drag: orbit");
-            igBulletText("Mouse wheel: zoom");
-            igBulletText("Space: pause");
-            igBulletText("R: reset weather");
-            igBulletText("Tab: cycle field");
-            igBulletText("H / J: toggle slices");
-            igBulletText("T: toggle terrain");
-            igBulletText("G: hide or show panel");
 
             igPopItemWidth();
         }
         igEndChild();
     }
     igEnd();
+    return terrainChanged;
 }
 
-static bool CreateSimFromOBJ(const char *path, AtmosphereSim *sim) {
+static void InitializeSimDimensions(AtmosphereSim *sim) {
     sim->nx = ATM_W;
     sim->nz = ATM_Z;
     sim->ny = ATM_Y;
-
-    if (!LoadOBJHeightField(path, &sim->terrain)) return false;
-
-    sim->worldWidth = (float)(sim->terrain.width - 1);
-    sim->worldDepth = (float)(sim->terrain.height - 1);
-    sim->topMeters = fmaxf(sim->terrain.maxTerrainMeters + 2400.0f, 4600.0f);
+    sim->worldWidth = (float)(TERRAIN_GEN_SIZE - 1);
+    sim->worldDepth = (float)(TERRAIN_GEN_SIZE - 1);
+    sim->topMeters = TERRAIN_GEN_HEIGHT_WORLD * OBJ_VERTICAL_METERS + 2400.0f;
     sim->topWorldY = WorldYFromMeters(sim->topMeters);
     sim->dxWorld = sim->worldWidth / (float)(sim->nx - 1);
     sim->dzWorld = sim->worldDepth / (float)(sim->nz - 1);
     sim->dxMeters = sim->dxWorld * OBJ_HORIZONTAL_METERS;
     sim->dzMeters = sim->dzWorld * OBJ_HORIZONTAL_METERS;
     sim->dyMeters = sim->topMeters / (float)sim->ny;
+}
 
-    sim->terrainModel = BuildTerrainModel(&sim->terrain);
+static bool RebuildGeneratedTerrain(AtmosphereSim *sim) {
+    bool preserveViewSettings = (sim->terrain.width > 0 && sim->terrain.height > 0);
+    SimViewSettings viewSettings = { 0 };
+    if (preserveViewSettings) {
+        viewSettings = CaptureSimViewSettings(sim);
+    }
+
+    if (sim->terrainModel.meshCount > 0) {
+        UnloadModel(sim->terrainModel);
+        sim->terrainModel = (Model) { 0 };
+    }
+    FreeTerrain(&sim->terrain);
+
+    if (!GenerateProceduralTerrain(&sim->terrain, &sim->terrainGen)) {
+        return false;
+    }
+
+    sim->terrainModel = BuildTerrainModel(&sim->terrain, &sim->terrainGen);
     if (sim->terrainModel.meshCount == 0) {
         FreeTerrain(&sim->terrain);
         return false;
     }
+
+    BuildAtmosColumns(sim);
+    ResetAtmosphere(sim);
+    if (preserveViewSettings) {
+        RestoreSimViewSettings(sim, &viewSettings);
+    }
+    UpdateStats(sim);
+    return true;
+}
+
+static bool CreateSimFromGeneratedTerrain(AtmosphereSim *sim) {
+    InitializeSimDimensions(sim);
+    DefaultTerrainGenSettings(&sim->terrainGen, GetRandomValue(1, 999999));
+    sim->activeControlTab = 0;
 
     if (!AllocateSim(sim)) {
         DestroySim(sim);
         return false;
     }
 
-    BuildAtmosColumns(sim);
-    ResetAtmosphere(sim);
-    UpdateStats(sim);
-    return true;
+    return RebuildGeneratedTerrain(sim);
 }
 
 int main(int argc, char **argv) {
-    const char *requestedPath = (argc > 1) ? argv[1] : "eroded_terrain.obj";
-    const char *fallbackPath = "C/eroded_terrain.obj";
+    (void)argc;
+    (void)argv;
     AtmosphereSim sim = { 0 };
 
     InitWindow(1360, 820, "Mountain Atmosphere Slices");
     SetTargetFPS(60);
 
-    if (!CreateSimFromOBJ(requestedPath, &sim) && !(argc <= 1 && CreateSimFromOBJ(fallbackPath, &sim))) {
-        fprintf(stderr, "Failed to load terrain OBJ. Tried '%s'%s.\n",
-                requestedPath, (argc <= 1) ? " and 'C/eroded_terrain.obj'" : "");
+    if (!CreateSimFromGeneratedTerrain(&sim)) {
+        fprintf(stderr, "Failed to initialize generated terrain.\n");
         CloseWindow();
         return 1;
     }
@@ -2448,11 +3052,19 @@ int main(int argc, char **argv) {
 
         rlImGuiBeginDelta(frameDt);
         if (sim.showUI) DrawImGuiHud(&sim);
-        DrawImGuiControls(&sim);
+        bool terrainChanged = DrawImGuiControls(&sim);
         ImGuiIO *io = igGetIO_Nil();
         imguiWantsMouse = (io != NULL) ? io->WantCaptureMouse : false;
         imguiWantsKeyboard = (io != NULL) ? io->WantCaptureKeyboard : false;
         rlImGuiEnd();
+
+        if (terrainChanged) {
+            target = (Vector3) {
+                sim.worldWidth * 0.5f,
+                Lerp(sim.terrain.minTerrainY, sim.terrain.maxTerrainY, 0.45f),
+                sim.worldDepth * 0.5f
+            };
+        }
 
         EndDrawing();
     }
