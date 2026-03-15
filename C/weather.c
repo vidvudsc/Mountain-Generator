@@ -162,6 +162,10 @@ typedef struct AtmosphereSim {
     Texture2D verticalTex;
     Texture2D volumeFieldTex;
     Texture2D cloudTerrainTex;
+    Texture2D terrainTexDirt;
+    Texture2D terrainTexCoast;
+    Texture2D terrainTexRock;
+    Texture2D terrainTexSnow;
     Color *horizontalPixels;
     Color *verticalPixels;
     Vector4 *volumeFieldPixels;
@@ -171,6 +175,7 @@ typedef struct AtmosphereSim {
     Model cloudVolumeModel;
     Shader cloudVolumeShader;
     Shader skyShader;
+    Shader terrainShader;
     int cloudVolumeLocMin;
     int cloudVolumeLocMax;
     int cloudVolumeLocCamera;
@@ -185,6 +190,15 @@ typedef struct AtmosphereSim {
     int skyLocAspect;
     int skyLocTanHalfFov;
     int skyLocSunStrength;
+    int terrainLocTexDirt;
+    int terrainLocTexCoast;
+    int terrainLocTexRock;
+    int terrainLocMinY;
+    int terrainLocMaxY;
+    int terrainLocRockThreshold;
+    int terrainLocTexScale;
+    int terrainLocMacroScale;
+    int terrainLocSunDir;
 
     FieldMode fieldMode;
     SliceAxis verticalAxis;
@@ -706,6 +720,305 @@ static const char *kSkyFs =
     "    sky = mix(sky * 0.35, sky, clamp(zenith + 0.1, 0.0, 1.0));\n"
     "    finalColor = vec4(sky, 1.0) * fragColor;\n"
     "}\n";
+
+static const char *kTerrainVs =
+    "#version 330\n"
+    "in vec3 vertexPosition;\n"
+    "in vec2 vertexTexCoord;\n"
+    "in vec3 vertexNormal;\n"
+    "in vec4 vertexColor;\n"
+    "uniform mat4 mvp;\n"
+    "uniform mat4 matModel;\n"
+    "out vec3 fragWorldPos;\n"
+    "out vec3 fragNormal;\n"
+    "out vec4 fragColor;\n"
+    "void main() {\n"
+    "    vec4 worldPos = matModel * vec4(vertexPosition, 1.0);\n"
+    "    fragWorldPos = worldPos.xyz;\n"
+    "    fragNormal = normalize(mat3(matModel) * vertexNormal);\n"
+    "    fragColor = vertexColor;\n"
+    "    gl_Position = mvp * vec4(vertexPosition, 1.0);\n"
+    "}\n";
+
+static const char *kTerrainFs =
+    "#version 330\n"
+    "in vec3 fragWorldPos;\n"
+    "in vec3 fragNormal;\n"
+    "in vec4 fragColor;\n"
+    "out vec4 finalColor;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform sampler2D texture1;\n"
+    "uniform sampler2D texture2;\n"
+    "uniform sampler2D texture3;\n"
+    "uniform float uTerrainMinY;\n"
+    "uniform float uTerrainMaxY;\n"
+    "uniform float uRockThreshold;\n"
+    "uniform float uTexScale;\n"
+    "uniform float uMacroScale;\n"
+    "uniform vec3 uSunDir;\n"
+    "uniform vec4 colDiffuse;\n"
+    "\n"
+    "float hash12(vec2 p) {\n"
+    "    vec3 p3 = fract(vec3(p.xyx) * 0.1031);\n"
+    "    p3 += dot(p3, p3.yzx + 33.33);\n"
+    "    return fract((p3.x + p3.y) * p3.z);\n"
+    "}\n"
+    "\n"
+    "float valueNoise(vec2 p) {\n"
+    "    vec2 i = floor(p);\n"
+    "    vec2 f = fract(p);\n"
+    "    f = f * f * (3.0 - 2.0 * f);\n"
+    "    float a = hash12(i);\n"
+    "    float b = hash12(i + vec2(1.0, 0.0));\n"
+    "    float c = hash12(i + vec2(0.0, 1.0));\n"
+    "    float d = hash12(i + vec2(1.0, 1.0));\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);\n"
+    "}\n"
+    "\n"
+    "vec3 sampleTriplanar(sampler2D tex, vec3 worldPos, vec3 blendWeights, float scale) {\n"
+    "    vec3 xProj = texture(tex, worldPos.yz * scale).rgb;\n"
+    "    vec3 yProj = texture(tex, worldPos.xz * scale).rgb;\n"
+    "    vec3 zProj = texture(tex, worldPos.xy * scale).rgb;\n"
+    "    return xProj * blendWeights.x + yProj * blendWeights.y + zProj * blendWeights.z;\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    vec3 normal = normalize(fragNormal);\n"
+    "    vec3 blend = pow(abs(normal), vec3(6.0));\n"
+    "    blend /= max(dot(blend, vec3(1.0)), 0.0001);\n"
+    "\n"
+    "    float heightNorm = clamp((fragWorldPos.y - uTerrainMinY) / max(uTerrainMaxY - uTerrainMinY, 0.001), 0.0, 1.0);\n"
+    "    float slope = 1.0 - clamp(normal.y, 0.0, 1.0);\n"
+    "    float macroNoise = valueNoise(fragWorldPos.xz * uMacroScale);\n"
+    "    float macroSignedNoise = (macroNoise - 0.5) * 2.0;\n"
+    "    float meadowNoise = valueNoise(fragWorldPos.xz * (uMacroScale * 5.6) + vec2(37.0, 19.0));\n"
+    "\n"
+    "    vec3 dirtTexA = sampleTriplanar(texture0, fragWorldPos, blend, uTexScale * 1.14);\n"
+    "    vec3 dirtTexB = sampleTriplanar(texture0, fragWorldPos + vec3(13.0, 5.0, 21.0), blend, uTexScale * 2.06);\n"
+    "    vec3 dirtTex = mix(dirtTexA, dirtTexB, 0.28 + 0.14 * macroNoise);\n"
+    "    vec3 grassTexA = sampleTriplanar(texture1, fragWorldPos, blend, uTexScale * 1.46);\n"
+    "    vec3 grassTexB = sampleTriplanar(texture1, fragWorldPos + vec3(27.0, 9.0, 17.0), blend, uTexScale * 2.78);\n"
+    "    vec3 grassTex = mix(grassTexA, grassTexB, 0.38 + 0.10 * macroNoise);\n"
+    "    grassTex *= mix(0.92, 1.10, meadowNoise);\n"
+    "    grassTex = mix(grassTex, grassTex * fragColor.rgb * vec3(0.92, 1.12, 0.88), 0.34);\n"
+    "    vec3 rockTexA = sampleTriplanar(texture2, fragWorldPos, blend, uTexScale * 1.38);\n"
+    "    vec3 rockTexB = sampleTriplanar(texture2, fragWorldPos + vec3(19.0, 11.0, 31.0), blend, uTexScale * 2.06);\n"
+    "    vec3 rockTex = mix(rockTexA, rockTexB, 0.52 + 0.14 * meadowNoise);\n"
+    "    rockTex *= mix(0.92, 1.06, macroNoise);\n"
+    "    vec3 snowTexA = sampleTriplanar(texture3, fragWorldPos, blend, uTexScale * 1.12);\n"
+    "    vec3 snowTexB = sampleTriplanar(texture3, fragWorldPos + vec3(9.0, 13.0, 5.0), blend, uTexScale * 1.82);\n"
+    "    vec3 snowTex = mix(snowTexA, snowTexB, 0.35 + 0.12 * macroNoise);\n"
+    "\n"
+    "    float rockW = smoothstep(uRockThreshold - 0.12, min(uRockThreshold + 0.12, 1.0), slope + max(heightNorm - 0.34, 0.0) * 0.16 + macroSignedNoise * 0.10);\n"
+    "    float flatness = smoothstep(0.48, 0.97, normal.y);\n"
+    "    float grassW = (1.0 - rockW) * flatness * (1.0 - smoothstep(0.46, 0.90, heightNorm)) * smoothstep(0.18, 0.78, meadowNoise + macroSignedNoise * 0.14);\n"
+    "    float dirtW = (1.0 - rockW) * (1.0 - smoothstep(0.10, 0.44, heightNorm + macroSignedNoise * 0.04)) * (1.0 - flatness * 0.90) * (0.55 + 0.25 * (1.0 - meadowNoise));\n"
+    "    float coastW = max(1.0 - grassW - dirtW - rockW, 0.0);\n"
+    "    float weightSum = max(grassW + dirtW + coastW + rockW, 0.0001);\n"
+    "    vec3 lowMix = mix(grassTex, dirtTex, 0.36 + 0.18 * (1.0 - meadowNoise));\n"
+    "    vec3 albedo = (grassTex * grassW + dirtTex * dirtW + lowMix * coastW + rockTex * rockW) / weightSum;\n"
+    "\n"
+    "    vec3 terrainTint = mix(vec3(1.0), fragColor.rgb * 1.12, 0.35);\n"
+    "    albedo *= terrainTint;\n"
+    "    albedo *= mix(0.92, 1.08, macroNoise);\n"
+    "\n"
+    "    float snowW = smoothstep(0.73, 0.95, heightNorm + macroSignedNoise * 0.06 - slope * 0.55);\n"
+    "    snowW *= smoothstep(0.12, 0.58, normal.y + 0.18);\n"
+    "    vec3 snowColor = mix(snowTex, snowTex * vec3(1.03, 1.04, 1.05), 0.25 + 0.10 * macroNoise);\n"
+    "    albedo = mix(albedo, snowColor, snowW);\n"
+    "\n"
+    "    vec3 sunDir = normalize(uSunDir);\n"
+    "    float diffuse = max(dot(normal, sunDir), 0.0);\n"
+    "    float ambient = 0.34;\n"
+    "    float backLight = 0.10 * max(dot(normal, normalize(vec3(-sunDir.x, 0.35, -sunDir.z))), 0.0);\n"
+    "    vec3 lit = albedo * (ambient + diffuse * 0.82 + backLight);\n"
+    "    finalColor = vec4(lit * colDiffuse.rgb, colDiffuse.a);\n"
+    "}\n";
+
+static void UnloadTerrainMaterialResources(AtmosphereSim *sim) {
+    if (sim->terrainTexDirt.id != 0) UnloadTexture(sim->terrainTexDirt);
+    if (sim->terrainTexCoast.id != 0) UnloadTexture(sim->terrainTexCoast);
+    if (sim->terrainTexRock.id != 0) UnloadTexture(sim->terrainTexRock);
+    if (sim->terrainTexSnow.id != 0) UnloadTexture(sim->terrainTexSnow);
+    if (sim->terrainShader.id != 0) UnloadShader(sim->terrainShader);
+
+    sim->terrainTexDirt = (Texture2D) { 0 };
+    sim->terrainTexCoast = (Texture2D) { 0 };
+    sim->terrainTexRock = (Texture2D) { 0 };
+    sim->terrainTexSnow = (Texture2D) { 0 };
+    sim->terrainShader = (Shader) { 0 };
+    sim->terrainLocTexDirt = -1;
+    sim->terrainLocTexCoast = -1;
+    sim->terrainLocTexRock = -1;
+    sim->terrainLocMinY = -1;
+    sim->terrainLocMaxY = -1;
+    sim->terrainLocRockThreshold = -1;
+    sim->terrainLocTexScale = -1;
+    sim->terrainLocMacroScale = -1;
+    sim->terrainLocSunDir = -1;
+}
+
+static bool ResolveTerrainAssetPath(const char *relativePath, char *outPath, size_t outPathSize) {
+    char altPath[1024];
+    snprintf(altPath, sizeof(altPath), "../%s", relativePath);
+
+    const char *candidatePaths[2] = { relativePath, altPath };
+    for (int i = 0; i < 2; i++) {
+        if (!FileExists(candidatePaths[i])) continue;
+        strncpy(outPath, candidatePaths[i], outPathSize - 1);
+        outPath[outPathSize - 1] = '\0';
+        return true;
+    }
+
+    outPath[0] = '\0';
+    return false;
+}
+
+static Texture2D LoadTerrainTextureAsset(const char *relativePath) {
+    char resolvedPath[1024];
+    if (!ResolveTerrainAssetPath(relativePath, resolvedPath, sizeof(resolvedPath))) return (Texture2D) { 0 };
+
+    Texture2D texture = LoadTexture(resolvedPath);
+    if (texture.id != 0) {
+        GenTextureMipmaps(&texture);
+        SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+        SetTextureWrap(texture, TEXTURE_WRAP_REPEAT);
+    }
+
+    return texture;
+}
+
+static Texture2D LoadBlendedTerrainTextureAssets(const char *relativePathA, const char *relativePathB) {
+    char resolvedPathA[1024];
+    char resolvedPathB[1024];
+    if (!ResolveTerrainAssetPath(relativePathA, resolvedPathA, sizeof(resolvedPathA))) return (Texture2D) { 0 };
+    if (!ResolveTerrainAssetPath(relativePathB, resolvedPathB, sizeof(resolvedPathB))) return (Texture2D) { 0 };
+
+    Image imageA = LoadImage(resolvedPathA);
+    Image imageB = LoadImage(resolvedPathB);
+    if (imageA.data == NULL || imageB.data == NULL) {
+        if (imageA.data != NULL) UnloadImage(imageA);
+        if (imageB.data != NULL) UnloadImage(imageB);
+        return (Texture2D) { 0 };
+    }
+
+    if (imageB.width != imageA.width || imageB.height != imageA.height) {
+        ImageResize(&imageB, imageA.width, imageA.height);
+    }
+
+    ImageFormat(&imageA, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    ImageFormat(&imageB, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+
+    Color *pixelsA = LoadImageColors(imageA);
+    Color *pixelsB = LoadImageColors(imageB);
+    int pixelCount = imageA.width * imageA.height;
+    Image mixedImage = { 0 };
+    Texture2D texture = { 0 };
+
+    if (pixelsA != NULL && pixelsB != NULL) {
+        Color *mixedPixels = (Color *)MemAlloc((size_t)pixelCount * sizeof(Color));
+        if (mixedPixels != NULL) {
+            for (int i = 0; i < pixelCount; i++) {
+                int x = i % imageA.width;
+                int y = i / imageA.width;
+                float localNoise = 0.5f + 0.5f * sinf((float)x * 0.061f + (float)y * 0.037f) * cosf((float)x * 0.019f - (float)y * 0.053f);
+                float blend = Clamp(0.38f + 0.32f * localNoise, 0.18f, 0.82f);
+                mixedPixels[i].r = (unsigned char)Clamp(pixelsA[i].r * (1.0f - blend) + pixelsB[i].r * blend, 0.0f, 255.0f);
+                mixedPixels[i].g = (unsigned char)Clamp(pixelsA[i].g * (1.0f - blend) + pixelsB[i].g * blend, 0.0f, 255.0f);
+                mixedPixels[i].b = (unsigned char)Clamp(pixelsA[i].b * (1.0f - blend) + pixelsB[i].b * blend, 0.0f, 255.0f);
+                mixedPixels[i].a = 255;
+            }
+
+            mixedImage.data = mixedPixels;
+            mixedImage.width = imageA.width;
+            mixedImage.height = imageA.height;
+            mixedImage.mipmaps = 1;
+            mixedImage.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+            texture = LoadTextureFromImage(mixedImage);
+            UnloadImage(mixedImage);
+        }
+    }
+
+    if (pixelsA != NULL) UnloadImageColors(pixelsA);
+    if (pixelsB != NULL) UnloadImageColors(pixelsB);
+    UnloadImage(imageA);
+    UnloadImage(imageB);
+
+    if (texture.id != 0) {
+        GenTextureMipmaps(&texture);
+        SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+        SetTextureWrap(texture, TEXTURE_WRAP_REPEAT);
+    }
+
+    return texture;
+}
+
+static bool SetupTerrainMaterialResources(AtmosphereSim *sim) {
+    UnloadTerrainMaterialResources(sim);
+
+    sim->terrainTexDirt = LoadTerrainTextureAsset("textures/dirt_1k.blend/textures/dirt_diff_1k.jpg");
+    sim->terrainTexCoast = LoadTerrainTextureAsset("textures/coast_sand_rocks_02_1k.blend/textures/coast_sand_rocks_02_diff_1k.jpg");
+    sim->terrainTexRock = LoadBlendedTerrainTextureAssets(
+        "textures/rock_ground_1k.blend/textures/rock_ground_diff_1k.jpg",
+        "textures/rocks_ground_06_1k.blend/textures/rocks_ground_06_diff_1k.jpg");
+    sim->terrainTexSnow = LoadTerrainTextureAsset("textures/snow_02_1k.blend/textures/snow_02_diff_1k.jpg");
+    if (sim->terrainTexDirt.id == 0 || sim->terrainTexCoast.id == 0 || sim->terrainTexRock.id == 0 || sim->terrainTexSnow.id == 0) {
+        UnloadTerrainMaterialResources(sim);
+        return false;
+    }
+
+    sim->terrainShader = LoadShaderFromMemory(kTerrainVs, kTerrainFs);
+    if (sim->terrainShader.id == 0) {
+        UnloadTerrainMaterialResources(sim);
+        return false;
+    }
+
+    sim->terrainLocMinY = GetShaderLocation(sim->terrainShader, "uTerrainMinY");
+    sim->terrainLocMaxY = GetShaderLocation(sim->terrainShader, "uTerrainMaxY");
+    sim->terrainLocRockThreshold = GetShaderLocation(sim->terrainShader, "uRockThreshold");
+    sim->terrainLocTexScale = GetShaderLocation(sim->terrainShader, "uTexScale");
+    sim->terrainLocMacroScale = GetShaderLocation(sim->terrainShader, "uMacroScale");
+    sim->terrainLocSunDir = GetShaderLocation(sim->terrainShader, "uSunDir");
+    sim->terrainShader.locs[SHADER_LOC_MAP_DIFFUSE] = GetShaderLocation(sim->terrainShader, "texture0");
+    sim->terrainShader.locs[SHADER_LOC_MAP_SPECULAR] = GetShaderLocation(sim->terrainShader, "texture1");
+    sim->terrainShader.locs[SHADER_LOC_MAP_NORMAL] = GetShaderLocation(sim->terrainShader, "texture2");
+    sim->terrainShader.locs[SHADER_LOC_MAP_ROUGHNESS] = GetShaderLocation(sim->terrainShader, "texture3");
+    return true;
+}
+
+static void ApplyTerrainMaterial(AtmosphereSim *sim) {
+    if (sim->terrainModel.meshCount == 0 || sim->terrainShader.id == 0) return;
+
+    Material *material = &sim->terrainModel.materials[0];
+    material->shader = sim->terrainShader;
+    material->maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+    material->maps[MATERIAL_MAP_DIFFUSE].texture = sim->terrainTexDirt;
+    material->maps[MATERIAL_MAP_SPECULAR].texture = sim->terrainTexCoast;
+    material->maps[MATERIAL_MAP_NORMAL].texture = sim->terrainTexRock;
+    material->maps[MATERIAL_MAP_ROUGHNESS].texture = sim->terrainTexSnow;
+}
+
+static void UpdateTerrainMaterialUniforms(const AtmosphereSim *sim) {
+    if (sim->terrainShader.id == 0) return;
+
+    float minY = sim->terrain.minTerrainY;
+    float maxY = sim->terrain.maxTerrainY;
+    float rockThreshold = sim->terrainGen.rockThreshold;
+    float texScale = 0.054f;
+    float macroScale = 0.016f;
+    Vector3 lightDir = sim->sunDir;
+    if (Vector3Length(lightDir) < 0.001f) lightDir = (Vector3) { 0.35f, 1.0f, 0.45f };
+    if (lightDir.y < 0.18f) lightDir.y = 0.18f;
+    lightDir = Vector3Normalize(lightDir);
+
+    if (sim->terrainLocMinY >= 0) SetShaderValue(sim->terrainShader, sim->terrainLocMinY, &minY, SHADER_UNIFORM_FLOAT);
+    if (sim->terrainLocMaxY >= 0) SetShaderValue(sim->terrainShader, sim->terrainLocMaxY, &maxY, SHADER_UNIFORM_FLOAT);
+    if (sim->terrainLocRockThreshold >= 0) SetShaderValue(sim->terrainShader, sim->terrainLocRockThreshold, &rockThreshold, SHADER_UNIFORM_FLOAT);
+    if (sim->terrainLocTexScale >= 0) SetShaderValue(sim->terrainShader, sim->terrainLocTexScale, &texScale, SHADER_UNIFORM_FLOAT);
+    if (sim->terrainLocMacroScale >= 0) SetShaderValue(sim->terrainShader, sim->terrainLocMacroScale, &macroScale, SHADER_UNIFORM_FLOAT);
+    if (sim->terrainLocSunDir >= 0) SetShaderValue(sim->terrainShader, sim->terrainLocSunDir, &lightDir.x, SHADER_UNIFORM_VEC3);
+
+}
 
 static bool SetupCloudVolumeResources(AtmosphereSim *sim) {
     sim->volumeAtlasCols = 4;
@@ -1671,6 +1984,7 @@ static void DestroySim(AtmosphereSim *sim) {
     if (sim->cloudTerrainTex.id != 0) UnloadTexture(sim->cloudTerrainTex);
     if (sim->cloudVolumeShader.id != 0) UnloadShader(sim->cloudVolumeShader);
     if (sim->skyShader.id != 0) UnloadShader(sim->skyShader);
+    UnloadTerrainMaterialResources(sim);
 
     free(sim->columnTerrainMeters);
     free(sim->columnTerrainWorldY);
@@ -3449,6 +3763,7 @@ static bool RebuildGeneratedTerrain(AtmosphereSim *sim) {
         FreeTerrain(&sim->terrain);
         return false;
     }
+    ApplyTerrainMaterial(sim);
 
     BuildAtmosColumns(sim);
     if (!UpdateCloudTerrainTexture(sim)) {
@@ -3470,6 +3785,10 @@ static bool CreateSimFromGeneratedTerrain(AtmosphereSim *sim) {
     if (!AllocateSim(sim)) {
         DestroySim(sim);
         return false;
+    }
+
+    if (!SetupTerrainMaterialResources(sim)) {
+        fprintf(stderr, "Warning: failed to load terrain texture resources, using vertex colors only.\n");
     }
 
     return RebuildGeneratedTerrain(sim);
@@ -3555,7 +3874,10 @@ int main(int argc, char **argv) {
         ClearBackground(SkyColor(&sim));
 
         BeginMode3D(camera);
-        if (sim.showTerrain) DrawModel(sim.terrainModel, (Vector3) { 0.0f, 0.0f, 0.0f }, 1.0f, Fade(WHITE, sim.terrainAlpha));
+        if (sim.showTerrain) {
+            UpdateTerrainMaterialUniforms(&sim);
+            DrawModel(sim.terrainModel, (Vector3) { 0.0f, 0.0f, 0.0f }, 1.0f, Fade(WHITE, sim.terrainAlpha));
+        }
         if (sim.showWireframe) DrawModelWires(sim.terrainModel, (Vector3) { 0.0f, 0.0f, 0.0f }, 1.0f, Fade(BLACK, 0.25f));
         DrawCloudVolume(&sim, camera);
         DrawSlices3D(&sim, camera);
