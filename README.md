@@ -1,6 +1,6 @@
 # 3D Mountains
 
-This project currently focuses on the C application in [`C/weather.c`](C/weather.c): a procedural mountain terrain viewer with a terrain-aware low-Mach atmosphere prototype, slice rendering, wind overlays, and an ImGui control panel.
+This project currently focuses on the C application in [`C/main/main.c`](C/main/main.c): a procedural mountain terrain viewer with a terrain-aware atmosphere prototype, slice rendering, wind overlays, and an ImGui control panel.
 
 ## C App Overview
 
@@ -12,14 +12,20 @@ The C build combines three main parts:
 
 ## Main C Files
 
-- [`C/weather.c`](C/weather.c)  
-  Main application: terrain generation, atmosphere solver, rendering, HUD, and controls.
+- [`C/main/main.c`](C/main/main.c)  
+  Main application loop, camera, UI, and system wiring.
+
+- [`C/main/weather.c`](C/main/weather.c)  
+  Weather simulation state, stepping, slice textures, and atmospheric rendering.
+
+- [`C/main/terrain.c`](C/main/terrain.c)  
+  Terrain generation, sampling, and terrain mesh rendering.
+
+- [`C/save/main.c`](C/save/main.c)  
+  Archived monolithic pre-refactor version kept for reference.
 
 - [`C/build_weather.sh`](C/build_weather.sh)  
   Build script for the weather visualizer.
-
-- [`C/main.c`](C/main.c)  
-  Older terrain-generation sandbox.
 
 - [`third_party/cimgui`](third_party/cimgui)  
   Dear ImGui C bindings.
@@ -75,6 +81,8 @@ The viewer can inspect:
 - vertical wind
 - buoyancy
 
+
+## Screenshots
 
 ### Main View
 
