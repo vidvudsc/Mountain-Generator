@@ -11,6 +11,7 @@ CFLAGS=(
   -std=c99
   -O2
   -Wno-typedef-redefinition
+  -I"$ROOT_DIR/C/main"
   -I"$ROOT_DIR/third_party/cimgui"
   -I"$ROOT_DIR/third_party/rlImGui"
   -I"$ROOT_DIR/third_party/rlImGui/extras"
@@ -27,7 +28,9 @@ CPPFLAGS=(
   -I/opt/homebrew/include
 )
 
-clang "${CFLAGS[@]}" -c "$ROOT_DIR/C/weather.c" -o "$BUILD_DIR/weather.o"
+clang "${CFLAGS[@]}" -c "$ROOT_DIR/C/main/main.c" -o "$BUILD_DIR/main.o"
+clang "${CFLAGS[@]}" -c "$ROOT_DIR/C/main/terrain.c" -o "$BUILD_DIR/terrain.o"
+clang "${CFLAGS[@]}" -c "$ROOT_DIR/C/main/weather.c" -o "$BUILD_DIR/weather.o"
 
 clang++ "${CPPFLAGS[@]}" -c "$ROOT_DIR/third_party/cimgui/cimgui.cpp" -o "$BUILD_DIR/cimgui.o"
 clang++ "${CPPFLAGS[@]}" -c "$ROOT_DIR/third_party/cimgui/imgui/imgui.cpp" -o "$BUILD_DIR/imgui.o"
@@ -39,6 +42,8 @@ clang++ "${CPPFLAGS[@]}" -c "$ROOT_DIR/third_party/rlImGui/rlImGui.cpp" -o "$BUI
 
 clang++ \
   "$BUILD_DIR/weather.o" \
+  "$BUILD_DIR/terrain.o" \
+  "$BUILD_DIR/main.o" \
   "$BUILD_DIR/cimgui.o" \
   "$BUILD_DIR/imgui.o" \
   "$BUILD_DIR/imgui_demo.o" \
