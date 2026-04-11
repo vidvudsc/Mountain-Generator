@@ -10,34 +10,6 @@ The C build combines three main parts:
 - an atmosphere solver with staggered face velocities, scalar advection, warm-rain microphysics, pressure projection, and terrain masking
 - a raylib + ImGui visualization layer for horizontal slices, vertical slices, solver stats, and camera controls
 
-## Main C Files
-
-- [`C/main/main.c`](C/main/main.c)
-  App entry point. It creates the window, sets up raylib + ImGui, handles camera orbit/input, runs the frame loop, and wires terrain and weather together.
-
-- [`C/main/terrain.c`](C/main/terrain.c)
-  Terrain system. It generates the mountain heightmap, applies erosion/smoothing, computes terrain derivatives, and builds the renderable terrain mesh.
-
-- [`C/main/weather.c`](C/main/weather.c)
-  Atmosphere and UI system. It owns the simulation state, timestep update path, diagnostics, slice textures, wind overlays, HUD, and control panel.
-
-## Shared Headers
-
-- [`C/main/sim.h`](C/main/sim.h)
-  Shared simulation types, constants, indexing helpers, and sampling helpers used by both terrain and weather.
-
-- [`C/main/terrain.h`](C/main/terrain.h)
-  Terrain-facing declarations exported to the rest of the app.
-
-- [`C/main/weather.h`](C/main/weather.h)
-  Weather/app-facing declarations exported to `main.c`.
-
-## Archived Reference
-
-- [`C/save/main.c`](C/save/main.c)
-  Preserved monolithic version kept as a reference copy. The current build does not use it.
-
-
 ## Screenshots
 
 ### Main View
@@ -70,6 +42,36 @@ C/weather
 ```bash
 ./C/weather
 ```
+
+
+## Main C Files
+
+- [`C/main/main.c`](C/main/main.c)
+  App entry point. It creates the window, sets up raylib + ImGui, handles camera orbit/input, runs the frame loop, and wires terrain and weather together.
+
+- [`C/main/terrain.c`](C/main/terrain.c)
+  Terrain system. It generates the mountain heightmap, applies erosion/smoothing, computes terrain derivatives, and builds the renderable terrain mesh.
+
+- [`C/main/weather.c`](C/main/weather.c)
+  Atmosphere and UI system. It owns the simulation state, timestep update path, diagnostics, slice textures, wind overlays, HUD, and control panel.
+
+## Shared Headers
+
+- [`C/main/sim.h`](C/main/sim.h)
+  Shared simulation types, constants, indexing helpers, and sampling helpers used by both terrain and weather.
+
+- [`C/main/terrain.h`](C/main/terrain.h)
+  Terrain-facing declarations exported to the rest of the app.
+
+- [`C/main/weather.h`](C/main/weather.h)
+  Weather/app-facing declarations exported to `main.c`.
+
+## Archived Reference
+
+- [`C/save/main.c`](C/save/main.c)
+  Preserved monolithic version kept as a reference copy. The current build does not use it.
+
+
 
 ## Controls
 
