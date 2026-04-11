@@ -1,197 +1,15 @@
 #include "terrain.h"
-#include "raymath.h"
-#include <float.h>
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
 
-static int TerrainIndex(const TerrainSurface *terrain, int x, int z) {
-    return z * terrain->width + x;
+void FreeTerrain(TerrainGrid *terrain) {
+    free(terrain->terrainY);
+    free(terrain->terrainMeters);
+    free(terrain->terrainDx);
+    free(terrain->terrainDz);
+    free(terrain->terrainSlope);
+    memset(terrain, 0, sizeof(*terrain));
 }
 
-static float Clamp01(float value) {
-    return Clamp(value, 0.0f, 1.0f);
-}
-
-static Color LerpColor(Color a, Color b, float t) {
-    t = Clamp01(t);
-    return (Color) {
-        (unsigned char)Lerp((float)a.r, (float)b.r, t),
-        (unsigned char)Lerp((float)a.g, (float)b.g, t),
-        (unsigned char)Lerp((float)a.b, (float)b.b, t),
-        (unsigned char)Lerp((float)a.a, (float)b.a, t)
-    };
-}
-
-static unsigned int Hash2D(int x, int z, int seed) {
-    unsigned int h = (unsigned int)(x * 0x8da6b343u) ^ (unsigned int)(z * 0xd8163841u) ^ (unsigned int)(seed * 0xcb1ab31fu);
-    h ^= h >> 13;
-    h *= 0x85ebca6bu;
-    h ^= h >> 16;
-    return h;
-}
-
-static float Gradient2D(unsigned int hash, float x, float z) {
-    switch (hash & 7u) {
-        case 0: return x + z;
-        case 1: return x - z;
-        case 2: return -x + z;
-        case 3: return -x - z;
-        case 4: return x;
-        case 5: return -x;
-        case 6: return z;
-        default: return -z;
-    }
-}
-
-static float SmoothStep5(float t) {
-    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
-}
-
-static float Perlin2D(float x, float z, int seed) {
-    int x0 = (int)floorf(x);
-    int z0 = (int)floorf(z);
-    int x1 = x0 + 1;
-    int z1 = z0 + 1;
-
-    float tx = x - (float)x0;
-    float tz = z - (float)z0;
-    float u = SmoothStep5(tx);
-    float v = SmoothStep5(tz);
-
-    float n00 = Gradient2D(Hash2D(x0, z0, seed), tx, tz);
-    float n10 = Gradient2D(Hash2D(x1, z0, seed), tx - 1.0f, tz);
-    float n01 = Gradient2D(Hash2D(x0, z1, seed), tx, tz - 1.0f);
-    float n11 = Gradient2D(Hash2D(x1, z1, seed), tx - 1.0f, tz - 1.0f);
-
-    return Lerp(Lerp(n00, n10, u), Lerp(n01, n11, u), v);
-}
-
-static float Fbm2D(float x, float z, int seed, int octaves, float lacunarity, float gain) {
-    float amplitude = 1.0f;
-    float frequency = 1.0f;
-    float sum = 0.0f;
-    float norm = 0.0f;
-
-    for (int octave = 0; octave < octaves; octave++) {
-        sum += Perlin2D(x * frequency, z * frequency, seed + octave * 37) * amplitude;
-        norm += amplitude;
-        amplitude *= gain;
-        frequency *= lacunarity;
-    }
-
-    return (norm > 0.0f) ? (sum / norm) : 0.0f;
-}
-
-static float Ridged2D(float x, float z, int seed, int octaves, float lacunarity, float gain, float sharpness) {
-    float amplitude = 1.0f;
-    float frequency = 1.0f;
-    float sum = 0.0f;
-    float norm = 0.0f;
-
-    for (int octave = 0; octave < octaves; octave++) {
-        float value = 1.0f - fabsf(Perlin2D(x * frequency, z * frequency, seed + octave * 53));
-        value = powf(Clamp01(value), sharpness);
-        sum += value * amplitude;
-        norm += amplitude;
-        amplitude *= gain;
-        frequency *= lacunarity;
-    }
-
-    return (norm > 0.0f) ? (sum / norm) : 0.0f;
-}
-
-static void NormalizeField(float *values, int count) {
-    float minValue = FLT_MAX;
-    float maxValue = -FLT_MAX;
-    for (int i = 0; i < count; i++) {
-        if (values[i] < minValue) minValue = values[i];
-        if (values[i] > maxValue) maxValue = values[i];
-    }
-
-    float span = fmaxf(maxValue - minValue, 0.0001f);
-    for (int i = 0; i < count; i++) {
-        values[i] = Clamp01((values[i] - minValue) / span);
-    }
-}
-
-static void SmoothField(float *values, int width, int height, int passes) {
-    if (passes <= 0) return;
-
-    int count = width * height;
-    float *scratch = (float *)malloc((size_t)count * sizeof(float));
-    if (scratch == NULL) return;
-
-    for (int pass = 0; pass < passes; pass++) {
-        memcpy(scratch, values, (size_t)count * sizeof(float));
-
-        for (int z = 1; z < height - 1; z++) {
-            for (int x = 1; x < width - 1; x++) {
-                float center = scratch[z * width + x] * 4.0f;
-                float cardinal = scratch[z * width + x - 1] +
-                                 scratch[z * width + x + 1] +
-                                 scratch[(z - 1) * width + x] +
-                                 scratch[(z + 1) * width + x];
-                float diagonal = scratch[(z - 1) * width + x - 1] +
-                                 scratch[(z - 1) * width + x + 1] +
-                                 scratch[(z + 1) * width + x - 1] +
-                                 scratch[(z + 1) * width + x + 1];
-                values[z * width + x] = (center + cardinal * 2.0f + diagonal) / 16.0f;
-            }
-        }
-    }
-
-    free(scratch);
-}
-
-static void ThermalErode(float *values, int width, int height, int passes, float talus) {
-    if (passes <= 0) return;
-
-    int count = width * height;
-    float *source = (float *)malloc((size_t)count * sizeof(float));
-    float *dest = (float *)malloc((size_t)count * sizeof(float));
-    if (source == NULL || dest == NULL) {
-        free(source);
-        free(dest);
-        return;
-    }
-
-    for (int pass = 0; pass < passes; pass++) {
-        memcpy(source, values, (size_t)count * sizeof(float));
-        memcpy(dest, source, (size_t)count * sizeof(float));
-
-        for (int z = 1; z < height - 1; z++) {
-            for (int x = 1; x < width - 1; x++) {
-                int i = z * width + x;
-                static const int kOffsets[4][2] = {
-                    { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 }
-                };
-
-                for (int neighbor = 0; neighbor < 4; neighbor++) {
-                    int nx = x + kOffsets[neighbor][0];
-                    int nz = z + kOffsets[neighbor][1];
-                    int n = nz * width + nx;
-                    float drop = source[i] - source[n];
-                    if (drop <= talus) continue;
-
-                    float move = (drop - talus) * 0.18f;
-                    dest[i] -= move;
-                    dest[n] += move;
-                }
-            }
-        }
-
-        memcpy(values, dest, (size_t)count * sizeof(float));
-    }
-
-    free(source);
-    free(dest);
-}
-
-static void ComputeDerivatives(TerrainSurface *terrain) {
-    terrain->minHeight = FLT_MAX;
-    terrain->maxHeight = -FLT_MAX;
-
+static void ComputeTerrainDerivatives(TerrainGrid *terrain) {
     for (int z = 0; z < terrain->height; z++) {
         for (int x = 0; x < terrain->width; x++) {
             int xl = (x > 0) ? x - 1 : x;
@@ -199,71 +17,371 @@ static void ComputeDerivatives(TerrainSurface *terrain) {
             int zd = (z > 0) ? z - 1 : z;
             int zu = (z + 1 < terrain->height) ? z + 1 : z;
 
-            float h = terrain->heightMap[TerrainIndex(terrain, x, z)];
-            float hL = terrain->heightMap[TerrainIndex(terrain, xl, z)];
-            float hR = terrain->heightMap[TerrainIndex(terrain, xr, z)];
-            float hD = terrain->heightMap[TerrainIndex(terrain, x, zd)];
-            float hU = terrain->heightMap[TerrainIndex(terrain, x, zu)];
+            float hL = terrain->terrainMeters[TerrainIndex(terrain, xl, z)];
+            float hR = terrain->terrainMeters[TerrainIndex(terrain, xr, z)];
+            float hD = terrain->terrainMeters[TerrainIndex(terrain, x, zd)];
+            float hU = terrain->terrainMeters[TerrainIndex(terrain, x, zu)];
 
-            float gradX = (hR - hL) / fmaxf((float)(xr - xl) * terrain->config.worldScale, 0.0001f);
-            float gradZ = (hU - hD) / fmaxf((float)(zu - zd) * terrain->config.worldScale, 0.0001f);
+            float dx = (hR - hL) / (fabsf((float)(xr - xl)) * OBJ_HORIZONTAL_METERS + 0.0001f);
+            float dz = (hU - hD) / (fabsf((float)(zu - zd)) * OBJ_HORIZONTAL_METERS + 0.0001f);
             int i = TerrainIndex(terrain, x, z);
-            terrain->gradX[i] = gradX;
-            terrain->gradZ[i] = gradZ;
-            terrain->slope[i] = sqrtf(gradX * gradX + gradZ * gradZ);
-
-            if (h < terrain->minHeight) terrain->minHeight = h;
-            if (h > terrain->maxHeight) terrain->maxHeight = h;
+            terrain->terrainDx[i] = dx;
+            terrain->terrainDz[i] = dz;
+            terrain->terrainSlope[i] = sqrtf(dx * dx + dz * dz);
         }
     }
 }
 
-static Color TerrainColor(float heightNorm, float slope, float shade) {
-    Color valley = (Color){ 42, 78, 52, 255 };
-    Color meadow = (Color){ 94, 132, 74, 255 };
-    Color alpine = (Color){ 136, 126, 98, 255 };
-    Color rock = (Color){ 122, 114, 108, 255 };
-    Color snow = (Color){ 231, 236, 240, 255 };
+static int TerrainGenIndex(int x, int z) {
+    return z * TERRAIN_GEN_SIZE + x;
+}
+
+void DefaultTerrainGenSettings(TerrainGenSettings *settings, int seed) {
+    settings->seed = (seed <= 0) ? 1337 : seed;
+    settings->frequency = 0.004f;
+    settings->amplitude = 1.0f;
+    settings->heightPower = 1.5f;
+    settings->octaves = 4;
+    settings->lacunarity = 1.9f;
+    settings->persistence = 0.5f;
+    settings->droplets = 700000;
+    settings->lifetime = 24;
+    settings->inertia = 0.02f;
+    settings->capacity = 2.0f;
+    settings->minSlope = 0.001f;
+    settings->erodeRate = 0.04f;
+    settings->depositRate = 0.04f;
+    settings->evaporate = 0.10f;
+    settings->maxStep = 1.0f;
+    settings->smoothPasses = 8;
+    settings->rockThreshold = 0.42f;
+}
+
+static unsigned int TerrainRngNext(unsigned int *state) {
+    *state = (*state * 1664525u) + 1013904223u;
+    return *state;
+}
+
+static float TerrainRng01(unsigned int *state) {
+    return (float)(TerrainRngNext(state) >> 8) * (1.0f / 16777216.0f);
+}
+
+static int TerrainHash(int x, int y, int seed) {
+    int h = x * 374761393 + y * 668265263 + seed * 362437;
+    h = (h ^ (h >> 13)) * 1274126177;
+    return h & 1023;
+}
+
+static float TerrainSmoothstep(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float TerrainGradient(int hash, float x, float y) {
+    switch (hash & 3) {
+        case 0: return x + y;
+        case 1: return -x + y;
+        case 2: return x - y;
+        default: return -x - y;
+    }
+}
+
+static float TerrainPerlin(float x, float y, int seed) {
+    int X = (int)floorf(x);
+    int Y = (int)floorf(y);
+    float xf = x - floorf(x);
+    float yf = y - floorf(y);
+
+    int h00 = TerrainHash(X, Y, seed);
+    int h10 = TerrainHash(X + 1, Y, seed);
+    int h01 = TerrainHash(X, Y + 1, seed);
+    int h11 = TerrainHash(X + 1, Y + 1, seed);
+
+    float u = TerrainSmoothstep(xf);
+    float v = TerrainSmoothstep(yf);
+
+    float n00 = TerrainGradient(h00, xf, yf);
+    float n10 = TerrainGradient(h10, xf - 1.0f, yf);
+    float n01 = TerrainGradient(h01, xf, yf - 1.0f);
+    float n11 = TerrainGradient(h11, xf - 1.0f, yf - 1.0f);
+
+    return Lerp(Lerp(n00, n10, u), Lerp(n01, n11, u), v);
+}
+
+static void NormalizeTerrainMap(float *map, int count) {
+    float minValue = FLT_MAX;
+    float maxValue = -FLT_MAX;
+    for (int i = 0; i < count; i++) {
+        if (map[i] < minValue) minValue = map[i];
+        if (map[i] > maxValue) maxValue = map[i];
+    }
+
+    float span = fmaxf(maxValue - minValue, 0.0001f);
+    for (int i = 0; i < count; i++) {
+        map[i] = Clamp((map[i] - minValue) / span, 0.0f, 1.0f);
+    }
+}
+
+static void GenerateNoiseHeightmap(float *map, const TerrainGenSettings *settings) {
+    unsigned int rng = (unsigned int)settings->seed;
+    float offsetX = TerrainRng01(&rng) * 10000.0f;
+    float offsetZ = TerrainRng01(&rng) * 10000.0f;
+    int count = TERRAIN_GEN_SIZE * TERRAIN_GEN_SIZE;
+
+    for (int z = 0; z < TERRAIN_GEN_SIZE; z++) {
+        for (int x = 0; x < TERRAIN_GEN_SIZE; x++) {
+            float noise = 0.0f;
+            float frequency = settings->frequency * settings->lacunarity;
+            float amplitude = settings->amplitude;
+            float totalAmplitude = 0.0f;
+
+            for (int octave = 0; octave < settings->octaves; octave++) {
+                float nx = ((float)x + offsetX) * frequency;
+                float nz = ((float)z + offsetZ) * frequency;
+                noise += TerrainPerlin(nx, nz, settings->seed + octave * 101) * amplitude;
+                totalAmplitude += amplitude;
+                amplitude *= settings->persistence;
+                frequency *= settings->lacunarity;
+            }
+
+            int index = TerrainGenIndex(x, z);
+            map[index] = (totalAmplitude > 0.0f) ? noise / totalAmplitude : 0.0f;
+            map[index] = (map[index] + 1.0f) * 0.5f;
+        }
+    }
+
+    NormalizeTerrainMap(map, count);
+
+    for (int i = 0; i < count; i++) {
+        map[i] = powf(Clamp(map[i], 0.0f, 1.0f), settings->heightPower);
+    }
+
+    NormalizeTerrainMap(map, count);
+}
+
+static void ApplyHydroErosionToMap(float *map, const TerrainGenSettings *settings) {
+    unsigned int rng = (unsigned int)(settings->seed * 9781 + 17);
+
+    for (int drop = 0; drop < settings->droplets; drop++) {
+        float x = TerrainRng01(&rng) * (float)(TERRAIN_GEN_SIZE - 2) + 0.5f;
+        float z = TerrainRng01(&rng) * (float)(TERRAIN_GEN_SIZE - 2) + 0.5f;
+        float dirX = 0.0f;
+        float dirZ = 0.0f;
+        float speed = 1.0f;
+        float water = 1.0f;
+        float sediment = 0.0f;
+
+        for (int life = 0; life < settings->lifetime; life++) {
+            int xi = (int)x;
+            int zi = (int)z;
+            if (xi < 0 || xi >= TERRAIN_GEN_SIZE - 1 || zi < 0 || zi >= TERRAIN_GEN_SIZE - 1) break;
+
+            float fx = x - (float)xi;
+            float fz = z - (float)zi;
+            float h00 = map[TerrainGenIndex(xi, zi)];
+            float h10 = map[TerrainGenIndex(xi + 1, zi)];
+            float h01 = map[TerrainGenIndex(xi, zi + 1)];
+            float h11 = map[TerrainGenIndex(xi + 1, zi + 1)];
+            float height = h00 * (1.0f - fx) * (1.0f - fz) +
+                           h10 * fx * (1.0f - fz) +
+                           h01 * (1.0f - fx) * fz +
+                           h11 * fx * fz;
+            float gradX = (h10 - h00) * (1.0f - fz) + (h11 - h01) * fz;
+            float gradZ = (h01 - h00) * (1.0f - fx) + (h11 - h10) * fx;
+
+            dirX = dirX * settings->inertia - gradX * (1.0f - settings->inertia);
+            dirZ = dirZ * settings->inertia - gradZ * (1.0f - settings->inertia);
+            float len = sqrtf(dirX * dirX + dirZ * dirZ);
+            if (len > 0.00001f) {
+                dirX /= len;
+                dirZ /= len;
+            } else {
+                dirX = (TerrainRng01(&rng) - 0.5f) * 2.0f;
+                dirZ = (TerrainRng01(&rng) - 0.5f) * 2.0f;
+            }
+
+            x += dirX;
+            z += dirZ;
+            if (x < 0.0f || x >= TERRAIN_GEN_SIZE - 1 || z < 0.0f || z >= TERRAIN_GEN_SIZE - 1) break;
+
+            xi = (int)x;
+            zi = (int)z;
+            fx = x - (float)xi;
+            fz = z - (float)zi;
+            float nh00 = map[TerrainGenIndex(xi, zi)];
+            float nh10 = map[TerrainGenIndex(xi + 1, zi)];
+            float nh01 = map[TerrainGenIndex(xi, zi + 1)];
+            float nh11 = map[TerrainGenIndex(xi + 1, zi + 1)];
+            float newHeight = nh00 * (1.0f - fx) * (1.0f - fz) +
+                              nh10 * fx * (1.0f - fz) +
+                              nh01 * (1.0f - fx) * fz +
+                              nh11 * fx * fz;
+            float delta = newHeight - height;
+
+            float capacity = fmaxf(-delta * speed * water * settings->capacity, settings->minSlope);
+            if (sediment > capacity || delta > 0.0f) {
+                float deposit = (delta > 0.0f) ? fminf(sediment, delta) : (sediment - capacity) * settings->depositRate;
+                deposit = fminf(deposit, settings->maxStep);
+                sediment -= deposit;
+
+                map[TerrainGenIndex(xi, zi)] = Clamp(map[TerrainGenIndex(xi, zi)] + deposit * (1.0f - fx) * (1.0f - fz), 0.0f, 1.0f);
+                map[TerrainGenIndex(xi + 1, zi)] = Clamp(map[TerrainGenIndex(xi + 1, zi)] + deposit * fx * (1.0f - fz), 0.0f, 1.0f);
+                map[TerrainGenIndex(xi, zi + 1)] = Clamp(map[TerrainGenIndex(xi, zi + 1)] + deposit * (1.0f - fx) * fz, 0.0f, 1.0f);
+                map[TerrainGenIndex(xi + 1, zi + 1)] = Clamp(map[TerrainGenIndex(xi + 1, zi + 1)] + deposit * fx * fz, 0.0f, 1.0f);
+            } else {
+                float erode = fminf((capacity - sediment) * settings->erodeRate, -delta);
+                erode = fminf(erode, settings->maxStep);
+
+                for (int ox = 0; ox <= 1; ox++) {
+                    for (int oz = 0; oz <= 1; oz++) {
+                        float weight = ((ox == 0) ? (1.0f - fx) : fx) * ((oz == 0) ? (1.0f - fz) : fz);
+                        int index = TerrainGenIndex(xi + ox, zi + oz);
+                        float deltaCell = fminf(map[index], erode * weight);
+                        map[index] = Clamp(map[index] - deltaCell, 0.0f, 1.0f);
+                        sediment += deltaCell;
+                    }
+                }
+            }
+
+            speed = sqrtf(fmaxf(speed * speed + fabsf(delta) * 0.1f, 0.0f));
+            water *= (1.0f - settings->evaporate);
+            if (water < 0.01f) break;
+        }
+    }
+}
+
+static void SmoothTerrainMap(float *map, int passes) {
+    int count = TERRAIN_GEN_SIZE * TERRAIN_GEN_SIZE;
+    float *scratch = (float *)malloc((size_t)count * sizeof(float));
+    if (scratch == NULL) return;
+
+    for (int pass = 0; pass < passes; pass++) {
+        memcpy(scratch, map, (size_t)count * sizeof(float));
+        for (int z = 1; z < TERRAIN_GEN_SIZE - 1; z++) {
+            for (int x = 1; x < TERRAIN_GEN_SIZE - 1; x++) {
+                float sum = 0.0f;
+                for (int dz = -1; dz <= 1; dz++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        sum += scratch[TerrainGenIndex(x + dx, z + dz)];
+                    }
+                }
+                map[TerrainGenIndex(x, z)] = sum / 9.0f;
+            }
+        }
+    }
+
+    free(scratch);
+}
+
+static void FillTerrainPits(float *map) {
+    const float epsilon = 1e-5f;
+    for (int pass = 0; pass < 3; pass++) {
+        for (int z = 1; z < TERRAIN_GEN_SIZE - 1; z++) {
+            for (int x = 1; x < TERRAIN_GEN_SIZE - 1; x++) {
+                float h = map[TerrainGenIndex(x, z)];
+                float localMin = h;
+                for (int dz = -1; dz <= 1; dz++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        float neighbor = map[TerrainGenIndex(x + dx, z + dz)];
+                        if (neighbor < localMin) localMin = neighbor;
+                    }
+                }
+                if (h < localMin - epsilon) {
+                    map[TerrainGenIndex(x, z)] = localMin;
+                }
+            }
+        }
+    }
+}
+
+bool GenerateProceduralTerrain(TerrainGrid *terrain, const TerrainGenSettings *settings) {
+    int count = TERRAIN_GEN_SIZE * TERRAIN_GEN_SIZE;
+    float *map = (float *)malloc((size_t)count * sizeof(float));
+    terrain->width = TERRAIN_GEN_SIZE;
+    terrain->height = TERRAIN_GEN_SIZE;
+    terrain->terrainY = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainMeters = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainDx = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainDz = (float *)calloc((size_t)count, sizeof(float));
+    terrain->terrainSlope = (float *)calloc((size_t)count, sizeof(float));
+
+    if (map == NULL || !terrain->terrainY || !terrain->terrainMeters || !terrain->terrainDx ||
+        !terrain->terrainDz || !terrain->terrainSlope) {
+        free(map);
+        FreeTerrain(terrain);
+        return false;
+    }
+
+    GenerateNoiseHeightmap(map, settings);
+    ApplyHydroErosionToMap(map, settings);
+    SmoothTerrainMap(map, settings->smoothPasses);
+    FillTerrainPits(map);
+    NormalizeTerrainMap(map, count);
+
+    terrain->minTerrainY = FLT_MAX;
+    terrain->maxTerrainY = -FLT_MAX;
+    terrain->minTerrainMeters = FLT_MAX;
+    terrain->maxTerrainMeters = -FLT_MAX;
+
+    for (int z = 0; z < TERRAIN_GEN_SIZE; z++) {
+        for (int x = 0; x < TERRAIN_GEN_SIZE; x++) {
+            int index = TerrainGenIndex(x, z);
+            float worldHeight = map[index] * TERRAIN_GEN_HEIGHT_WORLD;
+            terrain->terrainY[index] = worldHeight;
+            terrain->terrainMeters[index] = worldHeight * OBJ_VERTICAL_METERS;
+
+            if (terrain->terrainY[index] < terrain->minTerrainY) terrain->minTerrainY = terrain->terrainY[index];
+            if (terrain->terrainY[index] > terrain->maxTerrainY) terrain->maxTerrainY = terrain->terrainY[index];
+            if (terrain->terrainMeters[index] < terrain->minTerrainMeters) terrain->minTerrainMeters = terrain->terrainMeters[index];
+            if (terrain->terrainMeters[index] > terrain->maxTerrainMeters) terrain->maxTerrainMeters = terrain->terrainMeters[index];
+        }
+    }
+
+    free(map);
+    ComputeTerrainDerivatives(terrain);
+    return true;
+}
+
+static Color TerrainColor(float heightNorm, float slope, float shade, float rockThreshold) {
+    Color lowGrass = (Color) { 58, 93, 54, 255 };
+    Color alpine = (Color) { 122, 130, 82, 255 };
+    Color warmRock = (Color) { 133, 118, 103, 255 };
+    Color coldRock = (Color) { 173, 171, 168, 255 };
+    Color snow = (Color) { 236, 242, 247, 255 };
     Color base;
 
-    if (heightNorm > 0.84f) base = LerpColor(rock, snow, Clamp01((heightNorm - 0.84f) / 0.16f));
-    else if (slope > 0.68f) base = rock;
-    else if (heightNorm > 0.56f) base = LerpColor(meadow, alpine, Clamp01((heightNorm - 0.56f) / 0.28f));
-    else base = LerpColor(valley, meadow, Clamp01(heightNorm / 0.56f));
+    if (heightNorm > 0.86f) base = LerpColor(coldRock, snow, NormalizeRange(heightNorm, 0.86f, 1.0f));
+    else if (slope > rockThreshold) base = LerpColor(warmRock, coldRock, NormalizeRange(slope, rockThreshold, 1.0f));
+    else if (heightNorm > 0.52f) base = LerpColor(alpine, warmRock, NormalizeRange(heightNorm, 0.52f, 0.86f));
+    else base = LerpColor(lowGrass, alpine, NormalizeRange(heightNorm, 0.18f, 0.52f));
 
-    float lit = 0.28f + 0.72f * shade;
-    base.r = (unsigned char)Clamp((float)base.r * lit, 0.0f, 255.0f);
-    base.g = (unsigned char)Clamp((float)base.g * lit, 0.0f, 255.0f);
-    base.b = (unsigned char)Clamp((float)base.b * lit, 0.0f, 255.0f);
+    float lit = 0.32f + 0.68f * shade;
+    base.r = (unsigned char)Clamp(base.r * lit, 0.0f, 255.0f);
+    base.g = (unsigned char)Clamp(base.g * lit, 0.0f, 255.0f);
+    base.b = (unsigned char)Clamp(base.b * lit, 0.0f, 255.0f);
     return base;
 }
 
-static Model BuildModel(const TerrainSurface *terrain) {
+Model BuildTerrainModel(const TerrainGrid *terrain, const TerrainGenSettings *settings) {
     const int vertexCount = terrain->width * terrain->height;
-    const int triangleCount = (terrain->width - 1) * (terrain->height - 1) * 2;
-    const int indexCount = triangleCount * 3;
-
+    const int indexCount = (terrain->width - 1) * (terrain->height - 1) * 6;
     Vector3 *vertices = (Vector3 *)MemAlloc((size_t)vertexCount * sizeof(Vector3));
     Vector3 *normals = (Vector3 *)MemAlloc((size_t)vertexCount * sizeof(Vector3));
     Color *colors = (Color *)MemAlloc((size_t)vertexCount * sizeof(Color));
     int *indices = (int *)MemAlloc((size_t)indexCount * sizeof(int));
+
     if (!vertices || !normals || !colors || !indices || vertexCount > 65536) {
         if (vertices) MemFree(vertices);
         if (normals) MemFree(normals);
         if (colors) MemFree(colors);
         if (indices) MemFree(indices);
-        return (Model){ 0 };
+        return (Model) { 0 };
     }
 
     for (int z = 0; z < terrain->height; z++) {
         for (int x = 0; x < terrain->width; x++) {
             int i = TerrainIndex(terrain, x, z);
-            vertices[i] = (Vector3) {
-                (float)x * terrain->config.worldScale,
-                terrain->heightMap[i],
-                (float)z * terrain->config.worldScale
-            };
-            normals[i] = (Vector3){ 0.0f, 0.0f, 0.0f };
+            vertices[i] = (Vector3) { (float)x, terrain->terrainY[i], (float)z };
+            normals[i] = (Vector3) { 0.0f, 0.0f, 0.0f };
         }
     }
 
@@ -285,28 +403,30 @@ static Model BuildModel(const TerrainSurface *terrain) {
         int i2 = indices[i + 2];
         Vector3 edge1 = Vector3Subtract(vertices[i1], vertices[i0]);
         Vector3 edge2 = Vector3Subtract(vertices[i2], vertices[i0]);
-        Vector3 normal = Vector3Normalize(Vector3CrossProduct(edge1, edge2));
-        normals[i0] = Vector3Add(normals[i0], normal);
-        normals[i1] = Vector3Add(normals[i1], normal);
-        normals[i2] = Vector3Add(normals[i2], normal);
+        Vector3 n = Vector3Normalize(Vector3CrossProduct(edge1, edge2));
+        normals[i0] = Vector3Add(normals[i0], n);
+        normals[i1] = Vector3Add(normals[i1], n);
+        normals[i2] = Vector3Add(normals[i2], n);
     }
 
-    Vector3 lightDir = Vector3Normalize((Vector3){ 0.42f, 1.0f, 0.36f });
+    const Vector3 lightDir = Vector3Normalize((Vector3) { 0.35f, 1.0f, 0.45f });
     for (int i = 0; i < vertexCount; i++) {
         normals[i] = Vector3Normalize(normals[i]);
+        float slope = 1.0f - Clamp(Vector3DotProduct(normals[i], (Vector3) { 0.0f, 1.0f, 0.0f }), 0.0f, 1.0f);
         float shade = Clamp(Vector3DotProduct(normals[i], lightDir), 0.0f, 1.0f);
-        float slope = 1.0f - Clamp(Vector3DotProduct(normals[i], (Vector3){ 0.0f, 1.0f, 0.0f }), 0.0f, 1.0f);
-        float heightNorm = Clamp01((vertices[i].y - terrain->minHeight) / fmaxf(terrain->maxHeight - terrain->minHeight, 0.0001f));
-        colors[i] = TerrainColor(heightNorm, slope, shade);
+        float hNorm = NormalizeRange(vertices[i].y, terrain->minTerrainY, terrain->maxTerrainY);
+        float rockThreshold = (settings != NULL) ? settings->rockThreshold : 0.58f;
+        colors[i] = TerrainColor(hNorm, slope, shade, rockThreshold);
     }
 
     Mesh mesh = { 0 };
     mesh.vertexCount = vertexCount;
-    mesh.triangleCount = triangleCount;
+    mesh.triangleCount = indexCount / 3;
     mesh.vertices = (float *)MemAlloc((size_t)vertexCount * 3 * sizeof(float));
     mesh.normals = (float *)MemAlloc((size_t)vertexCount * 3 * sizeof(float));
     mesh.colors = (unsigned char *)MemAlloc((size_t)vertexCount * 4 * sizeof(unsigned char));
     mesh.indices = (unsigned short *)MemAlloc((size_t)indexCount * sizeof(unsigned short));
+
     if (!mesh.vertices || !mesh.normals || !mesh.colors || !mesh.indices) {
         if (mesh.vertices) MemFree(mesh.vertices);
         if (mesh.normals) MemFree(mesh.normals);
@@ -316,7 +436,7 @@ static Model BuildModel(const TerrainSurface *terrain) {
         MemFree(normals);
         MemFree(colors);
         MemFree(indices);
-        return (Model){ 0 };
+        return (Model) { 0 };
     }
 
     for (int i = 0; i < vertexCount; i++) {
@@ -331,10 +451,7 @@ static Model BuildModel(const TerrainSurface *terrain) {
         mesh.colors[i * 4 + 2] = colors[i].b;
         mesh.colors[i * 4 + 3] = colors[i].a;
     }
-
-    for (int i = 0; i < indexCount; i++) {
-        mesh.indices[i] = (unsigned short)indices[i];
-    }
+    for (int i = 0; i < indexCount; i++) mesh.indices[i] = (unsigned short)indices[i];
 
     UploadMesh(&mesh, true);
 
@@ -343,195 +460,4 @@ static Model BuildModel(const TerrainSurface *terrain) {
     MemFree(colors);
     MemFree(indices);
     return LoadModelFromMesh(mesh);
-}
-
-static void GenerateHeightMap(TerrainSurface *terrain) {
-    int count = terrain->width * terrain->height;
-    float *values = terrain->heightMap;
-    const TerrainConfig *config = &terrain->config;
-
-    for (int z = 0; z < terrain->height; z++) {
-        for (int x = 0; x < terrain->width; x++) {
-            float fx = (float)x / (float)(terrain->width - 1);
-            float fz = (float)z / (float)(terrain->height - 1);
-
-            float warpX = Fbm2D(fx * config->warpFrequency + 13.7f,
-                                fz * config->warpFrequency - 5.3f,
-                                config->seed + 11,
-                                3,
-                                2.0f,
-                                0.5f) * 0.14f;
-            float warpZ = Fbm2D(fx * config->warpFrequency - 7.9f,
-                                fz * config->warpFrequency + 3.1f,
-                                config->seed + 23,
-                                3,
-                                2.0f,
-                                0.5f) * 0.14f;
-
-            float nx = fx + warpX;
-            float nz = fz + warpZ;
-
-            float continent = 0.5f + 0.5f * Fbm2D(nx * config->baseFrequency * 0.38f,
-                                                  nz * config->baseFrequency * 0.38f,
-                                                  config->seed + 101,
-                                                  4,
-                                                  2.1f,
-                                                  0.52f);
-            float ridges = Ridged2D(nx * config->baseFrequency,
-                                    nz * config->baseFrequency,
-                                    config->seed + 151,
-                                    config->octaves,
-                                    config->lacunarity,
-                                    config->gain,
-                                    config->ridgeSharpness);
-            float peaks = Ridged2D((nx - warpZ * 0.4f) * config->baseFrequency * 1.85f,
-                                   (nz + warpX * 0.4f) * config->baseFrequency * 1.85f,
-                                   config->seed + 211,
-                                   3,
-                                   2.05f,
-                                   0.55f,
-                                   config->ridgeSharpness + 0.55f);
-            float valleys = 0.5f + 0.5f * Fbm2D(nx * config->baseFrequency * 0.72f,
-                                                nz * config->baseFrequency * 0.72f,
-                                                config->seed + 307,
-                                                3,
-                                                1.9f,
-                                                0.55f);
-
-            float mountainMask = powf(Clamp01(continent), 1.45f);
-            float value = ridges * (0.55f + 0.70f * mountainMask) +
-                          peaks * 0.22f +
-                          continent * 0.33f -
-                          (1.0f - valleys) * 0.12f;
-            values[z * terrain->width + x] = value;
-        }
-    }
-
-    NormalizeField(values, count);
-    for (int i = 0; i < count; i++) {
-        values[i] = powf(values[i], config->peakBias);
-    }
-
-    ThermalErode(values, terrain->width, terrain->height, config->thermalPasses, config->thermalTalus);
-    SmoothField(values, terrain->width, terrain->height, config->smoothingPasses);
-    NormalizeField(values, count);
-
-    for (int i = 0; i < count; i++) {
-        values[i] = config->baseHeight + values[i] * config->heightScale;
-    }
-}
-
-void TerrainConfig_Default(TerrainConfig *config, int seed) {
-    if (config == NULL) return;
-    config->seed = (seed <= 0) ? 1337 : seed;
-    config->resolution = 256;
-    config->octaves = 5;
-    config->smoothingPasses = 3;
-    config->thermalPasses = 18;
-    config->baseFrequency = 5.8f;
-    config->warpFrequency = 3.3f;
-    config->lacunarity = 2.05f;
-    config->gain = 0.52f;
-    config->ridgeSharpness = 1.85f;
-    config->peakBias = 1.45f;
-    config->thermalTalus = 0.015f;
-    config->worldScale = 1.0f;
-    config->heightScale = 118.0f;
-    config->baseHeight = 4.0f;
-}
-
-bool Terrain_Init(TerrainSurface *terrain, const TerrainConfig *config) {
-    if (terrain == NULL || config == NULL) return false;
-    memset(terrain, 0, sizeof(*terrain));
-    return Terrain_Rebuild(terrain, config);
-}
-
-bool Terrain_Rebuild(TerrainSurface *terrain, const TerrainConfig *config) {
-    if (terrain == NULL || config == NULL) return false;
-
-    if (terrain->model.meshCount > 0) {
-        UnloadModel(terrain->model);
-        terrain->model = (Model){ 0 };
-    }
-    free(terrain->heightMap);
-    free(terrain->gradX);
-    free(terrain->gradZ);
-    free(terrain->slope);
-    terrain->heightMap = NULL;
-    terrain->gradX = NULL;
-    terrain->gradZ = NULL;
-    terrain->slope = NULL;
-
-    terrain->config = *config;
-    terrain->width = config->resolution;
-    terrain->height = config->resolution;
-    terrain->worldWidth = (float)(terrain->width - 1) * config->worldScale;
-    terrain->worldDepth = (float)(terrain->height - 1) * config->worldScale;
-
-    int count = terrain->width * terrain->height;
-    terrain->heightMap = (float *)calloc((size_t)count, sizeof(float));
-    terrain->gradX = (float *)calloc((size_t)count, sizeof(float));
-    terrain->gradZ = (float *)calloc((size_t)count, sizeof(float));
-    terrain->slope = (float *)calloc((size_t)count, sizeof(float));
-    if (!terrain->heightMap || !terrain->gradX || !terrain->gradZ || !terrain->slope) {
-        Terrain_Shutdown(terrain);
-        return false;
-    }
-
-    GenerateHeightMap(terrain);
-    ComputeDerivatives(terrain);
-    terrain->model = BuildModel(terrain);
-    return terrain->model.meshCount > 0;
-}
-
-void Terrain_Shutdown(TerrainSurface *terrain) {
-    if (terrain == NULL) return;
-    if (terrain->model.meshCount > 0) UnloadModel(terrain->model);
-    free(terrain->heightMap);
-    free(terrain->gradX);
-    free(terrain->gradZ);
-    free(terrain->slope);
-    memset(terrain, 0, sizeof(*terrain));
-}
-
-void Terrain_Draw(const TerrainSurface *terrain, float alpha, bool wireframe) {
-    if (terrain == NULL || terrain->model.meshCount == 0) return;
-    DrawModel(terrain->model, (Vector3){ 0.0f, 0.0f, 0.0f }, 1.0f, Fade(WHITE, alpha));
-    if (wireframe) {
-        DrawModelWires(terrain->model, (Vector3){ 0.0f, 0.0f, 0.0f }, 1.0f, Fade(BLACK, 0.22f));
-    }
-}
-
-TerrainSample Terrain_Sample(const TerrainSurface *terrain, float x, float z) {
-    TerrainSample sample = { 0 };
-    if (terrain == NULL || terrain->heightMap == NULL) return sample;
-
-    float gridX = Clamp(x / fmaxf(terrain->config.worldScale, 0.0001f), 0.0f, (float)(terrain->width - 1));
-    float gridZ = Clamp(z / fmaxf(terrain->config.worldScale, 0.0001f), 0.0f, (float)(terrain->height - 1));
-    int x0 = (int)floorf(gridX);
-    int z0 = (int)floorf(gridZ);
-    int x1 = (x0 + 1 < terrain->width) ? x0 + 1 : x0;
-    int z1 = (z0 + 1 < terrain->height) ? z0 + 1 : z0;
-    float tx = gridX - (float)x0;
-    float tz = gridZ - (float)z0;
-
-    int i00 = TerrainIndex(terrain, x0, z0);
-    int i10 = TerrainIndex(terrain, x1, z0);
-    int i01 = TerrainIndex(terrain, x0, z1);
-    int i11 = TerrainIndex(terrain, x1, z1);
-
-    sample.height = Lerp(Lerp(terrain->heightMap[i00], terrain->heightMap[i10], tx),
-                         Lerp(terrain->heightMap[i01], terrain->heightMap[i11], tx),
-                         tz);
-    sample.gradX = Lerp(Lerp(terrain->gradX[i00], terrain->gradX[i10], tx),
-                        Lerp(terrain->gradX[i01], terrain->gradX[i11], tx),
-                        tz);
-    sample.gradZ = Lerp(Lerp(terrain->gradZ[i00], terrain->gradZ[i10], tx),
-                        Lerp(terrain->gradZ[i01], terrain->gradZ[i11], tx),
-                        tz);
-    sample.slope = Lerp(Lerp(terrain->slope[i00], terrain->slope[i10], tx),
-                        Lerp(terrain->slope[i01], terrain->slope[i11], tx),
-                        tz);
-    sample.normal = Vector3Normalize((Vector3){ -sample.gradX, 1.0f, -sample.gradZ });
-    return sample;
 }

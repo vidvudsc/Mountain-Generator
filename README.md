@@ -12,27 +12,44 @@ The C build combines three main parts:
 
 ## Main C Files
 
-- [`C/main/main.c`](C/main/main.c)  
-  Main application loop, camera, UI, and system wiring.
+- [`C/main/main.c`](C/main/main.c)
+  App entry point. It creates the window, sets up raylib + ImGui, handles camera orbit/input, runs the frame loop, and wires terrain and weather together.
 
-- [`C/main/weather.c`](C/main/weather.c)  
-  Weather simulation state, stepping, slice textures, and atmospheric rendering.
+- [`C/main/terrain.c`](C/main/terrain.c)
+  Terrain system. It generates the mountain heightmap, applies erosion/smoothing, computes terrain derivatives, and builds the renderable terrain mesh.
 
-- [`C/main/terrain.c`](C/main/terrain.c)  
-  Terrain generation, sampling, and terrain mesh rendering.
+- [`C/main/weather.c`](C/main/weather.c)
+  Atmosphere and UI system. It owns the simulation state, timestep update path, diagnostics, slice textures, wind overlays, HUD, and control panel.
 
-- [`C/save/main.c`](C/save/main.c)  
-  Archived monolithic pre-refactor version kept for reference.
+## Shared Headers
 
-- [`C/build_weather.sh`](C/build_weather.sh)  
-  Build script for the weather visualizer.
+- [`C/main/sim.h`](C/main/sim.h)
+  Shared simulation types, constants, indexing helpers, and sampling helpers used by both terrain and weather.
 
-- [`third_party/cimgui`](third_party/cimgui)  
-  Dear ImGui C bindings.
+- [`C/main/terrain.h`](C/main/terrain.h)
+  Terrain-facing declarations exported to the rest of the app.
 
-- [`third_party/rlImGui`](third_party/rlImGui)  
-  raylib integration for ImGui.
+- [`C/main/weather.h`](C/main/weather.h)
+  Weather/app-facing declarations exported to `main.c`.
 
+## Archived Reference
+
+- [`C/save/main.c`](C/save/main.c)
+  Preserved monolithic version kept as a reference copy. The current build does not use it.
+
+
+## Screenshots
+
+### Main View
+
+![Main View](docs/screenshots/main.png)
+
+
+### Slice View
+
+![Slice View](docs/screenshots/wind.png)
+
+  
 ## Build
 
 The current build script expects raylib headers and libraries to be available from Homebrew paths on macOS.
@@ -80,15 +97,3 @@ The viewer can inspect:
 - wind speed
 - vertical wind
 - buoyancy
-
-
-## Screenshots
-
-### Main View
-
-![Main View](docs/screenshots/main.png)
-
-
-### Slice View
-
-![Slice View](docs/screenshots/wind.png)
